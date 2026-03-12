@@ -10,9 +10,10 @@ from typing import Dict, List, NoReturn, Optional, Tuple
 
 from git_xtax import __version__, utils
 from git_xtax.annotation import Annotation
-from git_xtax.code_hosting import OrganizationAndRepository, PullRequest
+from git_xtax.code_hosting import CodeHostingClient, CodeHostingSpec, OrganizationAndRepository, PullRequest
 from git_xtax.exceptions import ExitCode, InteractionStopped, XtaxException, UnderlyingGitException, UnexpectedXtaxException
-from git_xtax.gitlab import GitLabClient, GITLAB_CLIENT_SPEC
+from git_xtax.gitlab import GITLAB_CLIENT_SPEC
+from git_xtax.github import GITHUB_CLIENT_SPEC
 from git_xtax.git_operations import (
     AnyRevision, GitContext, LocalBranchShortName,
     FullCommitHash, BranchPair,
@@ -21,6 +22,8 @@ from git_xtax.stack_state import StackStorage, XtaxState
 from git_xtax.utils import (
     AnsiEscapeCodes, bold, colored, debug, dim, fmt, rl_safe, underline, warn,
 )
+
+_KNOWN_SPECS: List[CodeHostingSpec] = [GITLAB_CLIENT_SPEC, GITHUB_CLIENT_SPEC]
 
 
 USAGE = f"""\
@@ -181,60 +184,65 @@ class XtaxClient:
     except Exception as e:
       debug(f"Failed to fetch stacks: {e}")
 
-  def _get_gitlab_client(self) -> Optional[GitLabClient]:
-    """Try to create a GitLab client from the origin remote URL."""
+  def _get_code_hosting_client(self) -> Optional[Tuple[CodeHostingClient, CodeHostingSpec]]:
+    """Try to create a code hosting client from the origin remote URL."""
     url = self._git.get_url_of_remote('origin')
     if not url:
       return None
-    org_repo = OrganizationAndRepository.from_url(GitLabClient.DEFAULT_GITLAB_DOMAIN, url)
-    if not org_repo:
-      return None
-    return GitLabClient(
-      domain=GitLabClient.DEFAULT_GITLAB_DOMAIN,
-      organization=org_repo.organization,
-      repository=org_repo.repository,
-    )
+    for spec in _KNOWN_SPECS:
+      org_repo = OrganizationAndRepository.from_url(spec.default_domain, url)
+      if org_repo:
+        client = spec.create_client(
+          domain=spec.default_domain,
+          organization=org_repo.organization,
+          repository=org_repo.repository,
+        )
+        return (client, spec)
+    return None
 
-  def _extract_mr_number(self, annotation: Optional[Annotation]) -> Optional[int]:
-    """Extract MR number from annotation text like 'MR !123'."""
+  def _extract_pr_number(self, annotation: Optional[Annotation], spec: CodeHostingSpec) -> Optional[int]:
+    """Extract PR/MR number from annotation text like 'MR !123' or 'PR #456'."""
     if not annotation or not annotation.text_without_qualifiers:
       return None
     text = annotation.text_without_qualifiers
     import re
-    match = re.match(r'MR\s*!(\d+)', text)
+    pattern = re.escape(spec.pr_short_name) + r'\s*' + re.escape(spec.pr_ordinal_char) + r'(\d+)'
+    match = re.match(pattern, text)
     return int(match.group(1)) if match else None
 
-  def _ensure_mr(self, client: GitLabClient, branch: LocalBranchShortName,
-                 parent: LocalBranchShortName, state: XtaxState, stack_name: str) -> None:
-    """Create or retarget an MR for branch."""
+  def _ensure_pr(self, client: CodeHostingClient, spec: CodeHostingSpec,
+                 branch: LocalBranchShortName, parent: LocalBranchShortName,
+                 state: XtaxState, stack_name: str) -> None:
+    """Create or retarget a PR/MR for branch."""
+    pr_label = f"{spec.pr_short_name} {spec.pr_ordinal_char}"
     annotation = state.annotations.get(branch)
-    existing_mr_number = self._extract_mr_number(annotation)
+    existing_pr_number = self._extract_pr_number(annotation, spec)
 
-    # If we already have an MR number, check if it's still open and needs retargeting
-    if existing_mr_number is not None:
-      mr = client.get_pull_request_by_number_or_none(existing_mr_number)
-      if mr and mr.state == 'opened':
-        if mr.base != str(parent):
-          client.set_base_of_pull_request(existing_mr_number, parent)
-          print(f"  Retargeted MR !{existing_mr_number} for {bold(branch)} → {bold(parent)}")
+    # If we already have a PR number, check if it's still open and needs retargeting
+    if existing_pr_number is not None:
+      pr = client.get_pull_request_by_number_or_none(existing_pr_number)
+      if pr and pr.state in ('opened', 'open'):
+        if pr.base != str(parent):
+          client.set_base_of_pull_request(existing_pr_number, parent)
+          print(f"  Retargeted {pr_label}{existing_pr_number} for {bold(branch)} → {bold(parent)}")
         else:
-          debug(f"Branch {branch} already has MR !{existing_mr_number} targeting {parent}")
+          debug(f"Branch {branch} already has {pr_label}{existing_pr_number} targeting {parent}")
         return
-      # MR is closed/merged — fall through to find or create a new one
+      # PR is closed/merged — fall through to find or create a new one
 
-    # Check if an open MR already exists with matching source and target
-    existing_mrs = client.get_open_pull_requests_by_head(branch)
-    matching_mr = next(
-      (m for m in existing_mrs if m.head == str(branch) and m.base == str(parent)),
+    # Check if an open PR already exists with matching source and target
+    existing_prs = client.get_open_pull_requests_by_head(branch)
+    matching_pr = next(
+      (m for m in existing_prs if m.head == str(branch) and m.base == str(parent)),
       None
     )
-    if matching_mr:
-      mr = matching_mr
-      print(f"  Found existing MR !{mr.number} for {bold(branch)} → {bold(parent)}")
+    if matching_pr:
+      pr = matching_pr
+      print(f"  Found existing {pr_label}{pr.number} for {bold(branch)} → {bold(parent)}")
     else:
-      # Create new MR
+      # Create new PR
       org_repo = client.get_org_and_repo()
-      mr = client.create_pull_request(
+      pr = client.create_pull_request(
         head=str(branch),
         head_org_repo=org_repo,
         base=str(parent),
@@ -242,14 +250,14 @@ class XtaxClient:
         description='',
         draft=True,
       )
-      print(f"  Created MR !{mr.number} for {bold(branch)} → {bold(parent)}")
+      print(f"  Created {pr_label}{pr.number} for {bold(branch)} → {bold(parent)}")
 
-    # Save MR annotation
-    mr_text = f"MR !{mr.number}"
+    # Save PR annotation
+    pr_text = f"{spec.pr_short_name} {spec.pr_ordinal_char}{pr.number}"
     qualifiers_text = ''
     if annotation and annotation.qualifiers.is_non_default():
       qualifiers_text = str(annotation.qualifiers)
-    full_text = f"{mr_text} {qualifiers_text}".strip() if qualifiers_text else mr_text
+    full_text = f"{pr_text} {qualifiers_text}".strip() if qualifiers_text else pr_text
     state.annotations[branch] = Annotation.parse(full_text)
     self._save_state(stack_name, state)
 
@@ -993,7 +1001,26 @@ class XtaxClient:
       self._sync_continue()
       return
 
-    name, state = self._resolve_current_stack()
+    try:
+      name, state = self._resolve_current_stack()
+    except XtaxException:
+      stacks = self._storage.list_stacks()
+      if not stacks:
+        print(fmt("<yellow>No stacks defined. Use `git xtax init <stack> <branch>` to create one.</yellow>"))
+        return
+      current = self._git.get_currently_checked_out_branch_or_none()
+      print(fmt(f"<yellow>Branch {bold(current)} is not in any stack.</yellow>"))
+      if not sys.stdin.isatty():
+        raise
+      print("Select a stack to sync:")
+      action, selected = self._interactive_stack_select(stacks, None)
+      if action != 'select' or not selected:
+        raise InteractionStopped()
+      content = self._storage.read_stack_definition(selected)
+      if content is None:
+        raise XtaxException(f"Stack {bold(selected)} not found")
+      name = selected
+      state = StackStorage.parse_definition(content)
     current = self._current_branch()
 
     print("Fetching from origin...")
@@ -1051,7 +1078,7 @@ class XtaxClient:
   def _sync_branches(self, stack_name: str, state: XtaxState,
                      branches: List[LocalBranchShortName], start_index: int,
                      original_branch: Optional[str] = None) -> None:
-    gitlab_client = self._get_gitlab_client()
+    hosting = self._get_code_hosting_client()
 
     for i in range(start_index, len(branches)):
       branch = branches[i]
@@ -1104,12 +1131,13 @@ class XtaxClient:
       except UnderlyingGitException as e:
         warn(f"Failed to push {bold(branch)}: {e}")
 
-      # Create or update MR
-      if gitlab_client and parent:
+      # Create or update PR/MR
+      if hosting and parent:
+        client, spec = hosting
         try:
-          self._ensure_mr(gitlab_client, branch, parent, state, stack_name)
+          self._ensure_pr(client, spec, branch, parent, state, stack_name)
         except Exception as e:
-          warn(f"Failed to create/update MR for {bold(branch)}: {e}")
+          warn(f"Failed to create/update {spec.pr_short_name} for {bold(branch)}: {e}")
 
     self._storage.clear_sync_state()
 
