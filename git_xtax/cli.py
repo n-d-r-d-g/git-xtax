@@ -289,7 +289,7 @@ class XtaxClient:
       # Check for --root in args to give better error
       positional = [a for a in args if not a.startswith('--')]
       if len(positional) < 2:
-        raise XtaxException("Usage: git xtax init <name> <branch> [--root=<base>]")
+        raise XtaxException("Usage: git xtax init <stack> <branch> [--root=<base>]")
 
     root: Optional[str] = None
     positional = []
@@ -300,7 +300,7 @@ class XtaxClient:
         positional.append(arg)
 
     if len(positional) < 2:
-      raise XtaxException("Usage: git xtax init <name> <branch> [--root=<base>]")
+      raise XtaxException("Usage: git xtax init <stack> <branch> [--root=<base>]")
 
     name = positional[0]
     first_branch_name = positional[1]
@@ -1245,7 +1245,7 @@ class XtaxClient:
 
       stacks = self._storage.list_stacks()
       if not stacks:
-        print("No stacks defined. Use `git xtax init <name> <branch>` to create one.")
+        print("No stacks defined. Use `git xtax init <stack> <branch>` to create one.")
         return
 
       if not sys.stdin.isatty():
@@ -1439,7 +1439,7 @@ class XtaxClient:
     if not args:
       stacks = self._storage.list_stacks()
       if not stacks:
-        raise XtaxException("No stacks defined. Use `git xtax init <name> <branch>` to create one.")
+        raise XtaxException("No stacks defined. Use `git xtax init <stack> <branch>` to create one.")
       current_stack = None
       try:
         current = self._git.get_currently_checked_out_branch_or_none()
