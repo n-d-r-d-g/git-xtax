@@ -184,20 +184,62 @@ class XtaxClient:
     except Exception as e:
       debug(f"Failed to fetch stacks: {e}")
 
+  @staticmethod
+  def _resolve_ssh_alias(url: str) -> Optional[str]:
+    """Resolve SSH aliases in git remote URLs (e.g. git@alias:org/repo → git@github.com:org/repo)."""
+    import re
+    import shutil
+    match = re.match(r'^git@([^:]+):(.+)$', url)
+    if not match:
+      return None
+    ssh_host = match.group(1)
+    path = match.group(2)
+    ssh = shutil.which('ssh')
+    if not ssh:
+      return None
+    exit_code, stdout, _ = utils.popen_cmd(ssh, '-G', ssh_host, hide_debug_output=True)
+    if exit_code != 0:
+      return None
+    for line in stdout.splitlines():
+      if line.startswith('hostname '):
+        real_host = line.split(' ', 1)[1].strip()
+        if real_host != ssh_host:
+          return f'git@{real_host}:{path}'
+        return None
+    return None
+
   def _get_code_hosting_client(self) -> Optional[Tuple[CodeHostingClient, CodeHostingSpec]]:
     """Try to create a code hosting client from the origin remote URL."""
-    url = self._git.get_url_of_remote('origin')
-    if not url:
+    raw_url = self._git.get_url_of_remote('origin')
+    if not raw_url:
       return None
-    for spec in _KNOWN_SPECS:
-      org_repo = OrganizationAndRepository.from_url(spec.default_domain, url)
-      if org_repo:
-        client = spec.create_client(
-          domain=spec.default_domain,
-          organization=org_repo.organization,
-          repository=org_repo.repository,
-        )
-        return (client, spec)
+    # Build list of URLs to try: raw, git insteadOf resolved, and SSH alias resolved
+    urls = [raw_url]
+    resolved_result = self._git._popen_git('remote', 'get-url', 'origin', allow_non_zero=True)
+    resolved_url = resolved_result.stdout.strip() if resolved_result.exit_code == 0 else None
+    if resolved_url and resolved_url != raw_url:
+      urls.append(resolved_url)
+    ssh_resolved = self._resolve_ssh_alias(urls[-1])
+    if ssh_resolved:
+      urls.append(ssh_resolved)
+    for url in urls:
+      for spec in _KNOWN_SPECS:
+        org_repo = OrganizationAndRepository.from_url(spec.default_domain, url)
+        if org_repo:
+          client = spec.create_client(
+            domain=spec.default_domain,
+            organization=org_repo.organization,
+            repository=org_repo.repository,
+          )
+          if not client.has_token():
+            print(colored(
+              f"No {spec.display_name} API token found. "
+              f"{spec.pr_short_name}s will not be created or updated.\n"
+              f"  Provide a token via one of the: {spec.token_providers_message}",
+              AnsiEscapeCodes.YELLOW
+            ), file=sys.stderr)
+            return None
+          return (client, spec)
     return None
 
   def _extract_pr_number(self, annotation: Optional[Annotation], spec: CodeHostingSpec) -> Optional[int]:

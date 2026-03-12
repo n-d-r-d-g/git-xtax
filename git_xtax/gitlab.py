@@ -105,6 +105,9 @@ class GitLabClient(CodeHostingClient):
         super().__init__(domain, organization, repository)
         self.__token: Optional[GitLabToken] = GitLabToken.for_domain(domain)
 
+    def has_token(self) -> bool:
+        return self.__token is not None
+
     @staticmethod
     def __get_merge_request_from_json(mr_json: Dict[str, Any]) -> PullRequest:
         return PullRequest(

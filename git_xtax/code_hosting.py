@@ -212,6 +212,10 @@ class CodeHostingClient(metaclass=ABCMeta):  # pragma: no cover
         return OrganizationAndRepository(self.organization, self.repository)
 
     @abstractmethod
+    def has_token(self) -> bool:
+        pass
+
+    @abstractmethod
     def create_pull_request(self, head: str, head_org_repo: OrganizationAndRepository,
                             *, base: str, title: str, description: str, draft: bool) -> PullRequest:
         pass

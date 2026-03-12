@@ -155,6 +155,9 @@ class GitHubClient(CodeHostingClient):
         super().__init__(domain, organization, repository)
         self.__token: Optional[GitHubToken] = GitHubToken.for_domain(domain)
 
+    def has_token(self) -> bool:
+        return self.__token is not None
+
     def __get_pull_request_from_json(self, pr_json: Dict[str, Any]) -> "PullRequest":
         return PullRequest(
             number=int(pr_json['number']),
