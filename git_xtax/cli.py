@@ -546,7 +546,7 @@ class XtaxClient:
       return colored(f"{node} {branch}  deleted", deleted_color)
 
     # Node marker follows highlighted; name color follows checked_out
-    active_color = "\033[38;2;52;235;149m"
+    active_color = AnsiEscapeCodes.GREEN
     is_highlighted = branch == highlighted
     is_checked_out = branch == (checked_out if checked_out is not None else highlighted)
 
@@ -757,7 +757,7 @@ class XtaxClient:
               try:
                 self.cmd_append([branch_name, f'--onto={root}'], stack_name=name)
               except XtaxException as e:
-                print(f"Error: {e}")
+                print(colored(f"Error: {e}", AnsiEscapeCodes.RED))
             # Re-enter cmd_view to show updated state
             return self.cmd_view(args, stack_name=stack_name)
           elif key == 'escape':
@@ -867,7 +867,7 @@ class XtaxClient:
           try:
             self.cmd_append([branch_name, f'--onto={selected_branch}'])
           except XtaxException as e:
-            print(f"Error: {e}")
+            print(colored(f"Error: {e}", AnsiEscapeCodes.RED))
       elif action == 'prepend':
         branch_name = input(rl_safe(f"Enter branch name to add before {bold(selected_branch)}: ")).strip()
         if branch_name:
@@ -877,7 +877,7 @@ class XtaxClient:
               self._git.checkout(selected_branch)
             self.cmd_prepend([branch_name])
           except XtaxException as e:
-            print(f"Error: {e}")
+            print(colored(f"Error: {e}", AnsiEscapeCodes.RED))
           finally:
             # Restore original checkout
             if current and current != selected_branch:
@@ -888,14 +888,14 @@ class XtaxClient:
           try:
             self.cmd_slideout([str(selected_branch)], stack_name=name)
           except XtaxException as e:
-            print(f"Error: {e}")
+            print(colored(f"Error: {e}", AnsiEscapeCodes.RED))
       elif action == 'rename':
         new_name = input(rl_safe(f"Rename {bold(selected_branch)} to: ")).strip()
         if new_name:
           try:
             self.cmd_rename_branch([str(selected_branch), new_name])
           except XtaxException as e:
-            print(f"Error: {e}")
+            print(colored(f"Error: {e}", AnsiEscapeCodes.RED))
 
       # Loop back to re-render interactive view
 
@@ -1245,7 +1245,7 @@ class XtaxClient:
 
       stacks = self._storage.list_stacks()
       if not stacks:
-        print("No stacks defined. Use `git xtax init <stack> <branch>` to create one.")
+        print(fmt("<yellow>No stacks defined. Use `git xtax init <stack> <branch>` to create one.</yellow>"))
         return
 
       if not sys.stdin.isatty():
@@ -1265,7 +1265,7 @@ class XtaxClient:
           try:
             self.cmd_delete([name])
           except XtaxException as e:
-            print(f"Error: {e}")
+            print(colored(f"Error: {e}", AnsiEscapeCodes.RED))
         # Loop back to re-render
       elif action == 'rename':
         new_name = input(rl_safe(f"Rename stack {bold(name)} to: ")).strip()
@@ -1273,7 +1273,7 @@ class XtaxClient:
           try:
             self.cmd_rename([name, new_name])
           except XtaxException as e:
-            print(f"Error: {e}")
+            print(colored(f"Error: {e}", AnsiEscapeCodes.RED))
         # Loop back to re-render
 
   def _xtax_ahead_behind_str(self) -> str:
@@ -1320,7 +1320,7 @@ class XtaxClient:
 
     print(f"  {dim('_xtax')}{self._xtax_ahead_behind_str()}")
 
-    active_color = "\033[38;2;52;235;149m"
+    active_color = AnsiEscapeCodes.GREEN
     for root, stack_names in roots.items():
       print(f"  {dim(root)}")
       for s in stack_names:
@@ -1365,7 +1365,7 @@ class XtaxClient:
           cursor = idx
           break
 
-    active_color = "\033[38;2;52;235;149m"
+    active_color = AnsiEscapeCodes.GREEN
     xtax_info = self._xtax_ahead_behind_str()
 
     def render(cursor_idx: int) -> str:
@@ -1439,7 +1439,7 @@ class XtaxClient:
     if not args:
       stacks = self._storage.list_stacks()
       if not stacks:
-        raise XtaxException("No stacks defined. Use `git xtax init <stack> <branch>` to create one.")
+        raise XtaxException("<yellow>No stacks defined. Use `git xtax init <stack> <branch>` to create one.</yellow>")
       current_stack = None
       try:
         current = self._git.get_currently_checked_out_branch_or_none()
@@ -1661,10 +1661,10 @@ def main() -> None:
       sys.exit(ExitCode.ARGUMENT_ERROR)
 
   except XtaxException as e:
-    print(f"Error: {e}", file=sys.stderr)
+    print(colored(f"Error: {e}", AnsiEscapeCodes.RED), file=sys.stderr)
     sys.exit(ExitCode.XTAX_EXCEPTION)
   except UnderlyingGitException as e:
-    print(f"Git error: {e}", file=sys.stderr)
+    print(colored(f"Git error: {e}", AnsiEscapeCodes.RED), file=sys.stderr)
     sys.exit(ExitCode.XTAX_EXCEPTION)
   except InteractionStopped:
     sys.exit(ExitCode.SUCCESS)
