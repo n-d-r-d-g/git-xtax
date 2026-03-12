@@ -1,0 +1,1675 @@
+import io
+import os
+import readline  # noqa: F401 — enables line editing in input()
+import shlex
+import subprocess
+import sys
+import tty
+import termios
+from typing import Dict, List, NoReturn, Optional, Tuple
+
+from git_xtax import __version__, utils
+from git_xtax.annotation import Annotation
+from git_xtax.code_hosting import OrganizationAndRepository, PullRequest
+from git_xtax.exceptions import ExitCode, InteractionStopped, XtaxException, UnderlyingGitException, UnexpectedXtaxException
+from git_xtax.gitlab import GitLabClient, GITLAB_CLIENT_SPEC
+from git_xtax.git_operations import (
+    AnyRevision, GitContext, LocalBranchShortName,
+    FullCommitHash, BranchPair,
+)
+from git_xtax.stack_state import StackStorage, XtaxState
+from git_xtax.utils import (
+    AnsiEscapeCodes, bold, colored, debug, dim, fmt, rl_safe, underline, warn,
+)
+
+
+USAGE = f"""\
+usage: git xtax <command> [<args>]
+
+{bold('Stack management:')}
+  init <name> <branch> [--root=<base>]  Create a new stack
+  a, append <branch> [--onto=<parent>]  Append branch below current (or --onto parent)
+  prepend <branch>                      Insert branch above current
+  slideout <branch>                     Slide branch out of stack
+  delete <name>                         Delete a stack
+  rename <old> <new>                    Rename a stack
+  rename-branch <old> <new>             Rename a branch in its stack
+  edit                                  Open stack definition in editor
+  switch <name>                         Switch to stack and checkout first branch
+
+{bold('Navigation:')}
+  v, view                               Show the current stack (interactive)
+  l, list                               Show all stacks (interactive)
+  u, up                                 Go to parent branch
+  d, down                               Go to child branch
+  t, top                                Go to top branch in stack
+  b, bottom                             Go to bottom branch in stack
+  <N>                                   Go N up (positive) or down (negative); 0 = root
+
+{bold('Sync & share:')}
+  s, sync [--current] [--continue]      Rebase + push entire stack (--current: from current branch down)
+  push                                  Push stacks to remote
+  fetch                                 Fetch stacks from remote
+
+{bold('General:')}
+  completions <shell>                   Print shell completion script (zsh, bash)
+  h, help                               Show this help
+  version                               Show version
+"""
+
+ZSH_COMPLETION = r'''
+_git-xtax() {
+  local -a commands
+  commands=(
+    'init:Create a new stack'
+    'append:Append branch below current'
+    'a:Append branch below current'
+    'prepend:Insert branch above current'
+    'slideout:Slide branch out of stack'
+    'delete:Delete a stack'
+    'rename:Rename a stack'
+    'rename-branch:Rename a branch in its stack'
+    'edit:Open stack definition in editor'
+    'switch:Switch to stack and checkout first branch'
+    'v:Show stack tree'
+    'list:Show all stacks'
+    'l:Show all stacks'
+    'view:Show stack tree'
+    'up:Go to parent branch'
+    'u:Go to parent branch'
+    'down:Go to first child branch'
+    'd:Go to first child branch'
+    'top:Go to top branch in stack'
+    't:Go to top branch in stack'
+    'f:Go to first branch in stack'
+    'bottom:Go to bottom branch in stack'
+    'b:Go to bottom branch in stack'
+    'l:Go to last branch in stack'
+    's:Rebase and push entire stack'
+    'sync:Rebase and push entire stack'
+    'push:Push stacks to remote'
+    'fetch:Fetch stacks from remote'
+    'completions:Print shell completion script'
+    'help:Show help'
+    'version:Show version'
+  )
+
+  _arguments -C \
+    '1:command:->command' \
+    '*:arg:->args'
+
+  case $state in
+    command)
+      _describe 'command' commands
+      ;;
+    args)
+      local subcmd=${words[2]}
+      (( CURRENT-- ))
+      shift words
+      case $subcmd in
+        init)
+          _arguments -s \
+            ':stack name:' \
+            ':branch:__git_xtax_branch_names' \
+            '--root=[Base branch]:branch:__git_xtax_branch_names'
+          ;;
+        append|a)
+          _arguments -s \
+            ':branch:__git_xtax_branch_names' \
+            '--onto=[Parent branch]:branch:__git_xtax_branch_names'
+          ;;
+        prepend)
+          _arguments ':branch:__git_xtax_branch_names'
+          ;;
+        slideout)
+          _arguments ':branch:__git_xtax_branch_names'
+          ;;
+        delete|switch)
+          _arguments ':stack:__git_xtax_stack_names'
+          ;;
+        sync)
+          _arguments '--current[Sync from current branch down]' '--continue[Continue after conflict]'
+          ;;
+        view|v)
+          _arguments '--all[Show all stacks]'
+          ;;
+        completions)
+          _arguments ':shell:(zsh bash)'
+          ;;
+      esac
+      ;;
+  esac
+}
+
+__git_xtax_branch_names() {
+  local -a branches
+  branches=(${${(f)"$(git branch --format='%(refname:short)' 2>/dev/null)"}})
+  _describe 'branch' branches
+}
+
+__git_xtax_stack_names() {
+  local -a stacks
+  stacks=(${${(f)"$(git-xtax view --all 2>/dev/null | grep '│' | sed 's/^.*[○◉] //')"}})
+  if [[ ${#stacks} -gt 0 ]]; then
+    _describe 'stack' stacks
+  fi
+}
+
+compdef _git-xtax git-xtax
+compdef _git-xtax gx
+'''
+
+
+class XtaxClient:
+
+  def __init__(self, git: GitContext, storage: StackStorage) -> None:
+    self._git = git
+    self._storage = storage
+
+  def _fetch_stacks(self) -> None:
+    """Fetch and fast-forward _xtax from origin."""
+    try:
+      result = self._storage.fetch_and_fast_forward()
+      if result == 'created':
+        print(dim("Fetched stack data from origin (new)"))
+      elif result == 'updated':
+        print(dim("Fetched stack data from origin (updated)"))
+      elif result == 'ahead':
+        print(dim("Stack data has local changes not yet pushed"))
+    except XtaxException:
+      raise
+    except Exception as e:
+      debug(f"Failed to fetch stacks: {e}")
+
+  def _get_gitlab_client(self) -> Optional[GitLabClient]:
+    """Try to create a GitLab client from the origin remote URL."""
+    url = self._git.get_url_of_remote('origin')
+    if not url:
+      return None
+    org_repo = OrganizationAndRepository.from_url(GitLabClient.DEFAULT_GITLAB_DOMAIN, url)
+    if not org_repo:
+      return None
+    return GitLabClient(
+      domain=GitLabClient.DEFAULT_GITLAB_DOMAIN,
+      organization=org_repo.organization,
+      repository=org_repo.repository,
+    )
+
+  def _extract_mr_number(self, annotation: Optional[Annotation]) -> Optional[int]:
+    """Extract MR number from annotation text like 'MR !123'."""
+    if not annotation or not annotation.text_without_qualifiers:
+      return None
+    text = annotation.text_without_qualifiers
+    import re
+    match = re.match(r'MR\s*!(\d+)', text)
+    return int(match.group(1)) if match else None
+
+  def _ensure_mr(self, client: GitLabClient, branch: LocalBranchShortName,
+                 parent: LocalBranchShortName, state: XtaxState, stack_name: str) -> None:
+    """Create or retarget an MR for branch."""
+    annotation = state.annotations.get(branch)
+    existing_mr_number = self._extract_mr_number(annotation)
+
+    # If we already have an MR number, check if it's still open and needs retargeting
+    if existing_mr_number is not None:
+      mr = client.get_pull_request_by_number_or_none(existing_mr_number)
+      if mr and mr.state == 'opened':
+        if mr.base != str(parent):
+          client.set_base_of_pull_request(existing_mr_number, parent)
+          print(f"  Retargeted MR !{existing_mr_number} for {bold(branch)} → {bold(parent)}")
+        else:
+          debug(f"Branch {branch} already has MR !{existing_mr_number} targeting {parent}")
+        return
+      # MR is closed/merged — fall through to find or create a new one
+
+    # Check if an open MR already exists with matching source and target
+    existing_mrs = client.get_open_pull_requests_by_head(branch)
+    matching_mr = next(
+      (m for m in existing_mrs if m.head == str(branch) and m.base == str(parent)),
+      None
+    )
+    if matching_mr:
+      mr = matching_mr
+      print(f"  Found existing MR !{mr.number} for {bold(branch)} → {bold(parent)}")
+    else:
+      # Create new MR
+      org_repo = client.get_org_and_repo()
+      mr = client.create_pull_request(
+        head=str(branch),
+        head_org_repo=org_repo,
+        base=str(parent),
+        title=str(branch),
+        description='',
+        draft=True,
+      )
+      print(f"  Created MR !{mr.number} for {bold(branch)} → {bold(parent)}")
+
+    # Save MR annotation
+    mr_text = f"MR !{mr.number}"
+    qualifiers_text = ''
+    if annotation and annotation.qualifiers.is_non_default():
+      qualifiers_text = str(annotation.qualifiers)
+    full_text = f"{mr_text} {qualifiers_text}".strip() if qualifiers_text else mr_text
+    state.annotations[branch] = Annotation.parse(full_text)
+    self._save_state(stack_name, state)
+
+  def _save_state(self, name: str, state: XtaxState) -> None:
+    content = StackStorage.render_definition(state)
+    self._storage.write_stack_definition(name, content)
+
+  def _current_branch(self) -> LocalBranchShortName:
+    branch = self._git.get_currently_checked_out_branch_or_none()
+    if not branch:
+      raise XtaxException("Not on any branch (detached HEAD)")
+    return branch
+
+  def _resolve_stack_for_branch(self, branch: LocalBranchShortName) -> Tuple[str, XtaxState]:
+    """Find the stack that contains a managed branch."""
+    stack_name = self._storage.find_stack_for_branch(branch)
+    if not stack_name:
+      raise XtaxException(
+        f"Branch {bold(branch)} is not in any stack. "
+        f"Check out a branch in a stack, or use --onto=<parent>.")
+    content = self._storage.read_stack_definition(stack_name)
+    if content is None:
+      raise XtaxException(f"Stack {bold(stack_name)} not found")
+    state = StackStorage.parse_definition(content)
+    return stack_name, state
+
+  def _resolve_current_stack(self) -> Tuple[str, XtaxState]:
+    """Resolve the stack from the currently checked out branch."""
+    current = self._current_branch()
+    return self._resolve_stack_for_branch(current)
+
+  # --- Commands ---
+
+  def cmd_init(self, args: List[str]) -> None:
+    self._fetch_stacks()
+    if len(args) < 2:
+      # Check for --root in args to give better error
+      positional = [a for a in args if not a.startswith('--')]
+      if len(positional) < 2:
+        raise XtaxException("Usage: git xtax init <name> <branch> [--root=<base>]")
+
+    root: Optional[str] = None
+    positional = []
+    for arg in args:
+      if arg.startswith('--root='):
+        root = arg[len('--root='):]
+      else:
+        positional.append(arg)
+
+    if len(positional) < 2:
+      raise XtaxException("Usage: git xtax init <name> <branch> [--root=<base>]")
+
+    name = positional[0]
+    first_branch_name = positional[1]
+
+    # Check if stack already exists
+    existing = self._storage.list_stacks()
+    if name in existing:
+      raise XtaxException(f"Stack {bold(name)} already exists")
+
+    if root is None:
+      root = str(self._current_branch())
+
+    # Check that first branch isn't already in another stack
+    first_branch = LocalBranchShortName.of(first_branch_name)
+    existing_stack = self._storage.find_stack_for_branch(first_branch)
+    if existing_stack:
+      raise XtaxException(
+        f"Branch {bold(first_branch)} is already in stack {bold(existing_stack)}")
+
+    root_branch = LocalBranchShortName.of(root)
+
+    # Create branch if it doesn't exist
+    if first_branch not in self._git.get_local_branches():
+      answer = input(rl_safe(f"Branch {bold(first_branch)} does not exist. Create it from {bold(root_branch)}? [y/N] "))
+      if answer.lower() not in ('y', 'yes'):
+        raise XtaxException("Aborted")
+      self._git.create_branch(first_branch, AnyRevision.of(str(root_branch)), switch_head=False)
+      print(f"Created branch {bold(first_branch)} from {bold(root_branch)}")
+
+    state = XtaxState()
+    state.root = root_branch
+    state.managed_branches.append(first_branch)
+    state.down_branches_for[root_branch] = [first_branch]
+    state.up_branch_for[first_branch] = root_branch
+
+    self._save_state(name, state)
+    print(f"Created stack {bold(name)} (root: {bold(root)}, branch: {bold(first_branch)})")
+
+  def cmd_append(self, args: List[str], stack_name: Optional[str] = None) -> None:
+    if not args:
+      raise XtaxException("Usage: git xtax append <branch> [--onto=<parent>]")
+
+    branch_name = args[0]
+    onto: Optional[str] = None
+    for arg in args[1:]:
+      if arg.startswith('--onto='):
+        onto = arg[len('--onto='):]
+
+    branch = LocalBranchShortName.of(branch_name)
+
+    # Check branch isn't already in a stack
+    existing_stack = self._storage.find_stack_for_branch(branch)
+    if existing_stack:
+      raise XtaxException(
+        f"Branch {bold(branch)} is already in stack {bold(existing_stack)}")
+
+    # Resolve parent and stack
+    if stack_name:
+      content = self._storage.read_stack_definition(stack_name)
+      if content is None:
+        raise XtaxException(f"Stack {bold(stack_name)} not found")
+      name = stack_name
+      state = StackStorage.parse_definition(content)
+      parent = LocalBranchShortName.of(onto) if onto else state.root
+    elif onto is not None:
+      parent = LocalBranchShortName.of(onto)
+      name, state = self._resolve_stack_for_branch(parent)
+    else:
+      current = self._current_branch()
+      parent = current
+      name, state = self._resolve_stack_for_branch(current)
+
+    # Reject adding onto root (unless stack is empty)
+    if parent == state.root and state.managed_branches:
+      raise XtaxException(
+        f"Cannot add onto root branch {bold(parent)}. "
+        f"Add onto a non-root branch in the stack.")
+
+    if parent != state.root and parent not in state.managed_branches:
+      raise XtaxException(f"Branch {bold(parent)} is not in the stack")
+
+    # Create branch if it doesn't exist
+    if branch not in self._git.get_local_branches():
+      answer = input(rl_safe(f"Branch {bold(branch)} does not exist. Create it from {bold(parent)}? [y/N] "))
+      if answer.lower() not in ('y', 'yes'):
+        raise XtaxException("Aborted")
+      self._git.create_branch(branch, AnyRevision.of(str(parent)), switch_head=False)
+      print(f"Created branch {bold(branch)} from {bold(parent)}")
+
+    existing_child = None
+    if parent in state.down_branches_for and state.down_branches_for[parent]:
+      existing_child = state.down_branches_for[parent][0]
+
+    if existing_child:
+      # Insert between parent and existing child:
+      # parent -> branch -> existing_child (was: parent -> existing_child)
+      state.down_branches_for[parent] = [branch]
+      state.up_branch_for[branch] = parent
+      state.down_branches_for[branch] = [existing_child]
+      state.up_branch_for[existing_child] = branch
+      managed_idx = state.managed_branches.index(existing_child)
+      state.managed_branches.insert(managed_idx, branch)
+    else:
+      state.down_branches_for[parent] = [branch]
+      state.up_branch_for[branch] = parent
+      state.managed_branches.append(branch)
+
+    self._save_state(name, state)
+    print(f"Appended {bold(branch)} onto {bold(parent)} in stack {bold(name)}")
+
+  def cmd_prepend(self, args: List[str]) -> None:
+    if not args:
+      raise XtaxException("Usage: git xtax prepend <branch>")
+
+    branch_name = args[0]
+    branch = LocalBranchShortName.of(branch_name)
+
+    # Check branch isn't already in a stack
+    existing_stack = self._storage.find_stack_for_branch(branch)
+    if existing_stack:
+      raise XtaxException(
+        f"Branch {bold(branch)} is already in stack {bold(existing_stack)}")
+
+    # The current branch is the one we insert above
+    current = self._current_branch()
+    name, state = self._resolve_stack_for_branch(current)
+
+    if current not in state.managed_branches:
+      raise XtaxException(f"Branch {bold(current)} is not in the stack")
+
+    parent = state.up_branch_for.get(current, state.root)
+
+    # Create branch if it doesn't exist
+    if branch not in self._git.get_local_branches():
+      answer = input(rl_safe(f"Branch {bold(branch)} does not exist. Create it from {bold(parent)}? [y/N] "))
+      if answer.lower() not in ('y', 'yes'):
+        raise XtaxException("Aborted")
+      self._git.create_branch(branch, AnyRevision.of(str(parent)), switch_head=False)
+      print(f"Created branch {bold(branch)} from {bold(parent)}")
+
+    # Insert branch between parent and current:
+    # parent -> branch -> current (was: parent -> current)
+
+    # 1. Replace current with branch in parent's children list
+    if parent in state.down_branches_for:
+      children = state.down_branches_for[parent]
+      idx = children.index(current)
+      children[idx] = branch
+    else:
+      state.down_branches_for[parent] = [branch]
+
+    # 2. branch becomes child of parent
+    state.up_branch_for[branch] = parent
+
+    # 3. current becomes child of branch
+    state.up_branch_for[current] = branch
+    state.down_branches_for[branch] = [current]
+
+    # 4. Add branch to managed list (before current)
+    managed_idx = state.managed_branches.index(current)
+    state.managed_branches.insert(managed_idx, branch)
+
+    self._save_state(name, state)
+    print(f"Prepended {bold(branch)} before {bold(current)} in stack {bold(name)}")
+
+  def cmd_slideout(self, args: List[str], stack_name: Optional[str] = None) -> None:
+    if not args:
+      raise XtaxException("Usage: git xtax slideout <branch>")
+
+    if stack_name:
+      content = self._storage.read_stack_definition(stack_name)
+      if content is None:
+        raise XtaxException(f"Stack {bold(stack_name)} not found")
+      name = stack_name
+      state = StackStorage.parse_definition(content)
+    else:
+      name, state = self._resolve_current_stack()
+    branch = LocalBranchShortName.of(args[0])
+
+    if branch not in state.managed_branches:
+      raise XtaxException(f"Branch {bold(branch)} is not in the stack")
+
+    # Re-parent children to branch's parent (slide out)
+    parent = state.up_branch_for.get(branch)
+    children = state.down_branches_for.get(branch, [])
+
+    for child in children:
+      if parent and parent != state.root:
+        state.up_branch_for[child] = parent
+      elif parent == state.root:
+        # Child becomes a direct child of root
+        state.up_branch_for[child] = state.root
+      else:
+        del state.up_branch_for[child]
+
+    if parent and parent in state.down_branches_for:
+      idx = state.down_branches_for[parent].index(branch)
+      state.down_branches_for[parent][idx:idx + 1] = children
+      if not state.down_branches_for[parent]:
+        del state.down_branches_for[parent]
+
+    state.managed_branches.remove(branch)
+    if branch in state.down_branches_for:
+      del state.down_branches_for[branch]
+    if branch in state.up_branch_for:
+      del state.up_branch_for[branch]
+    if branch in state.annotations:
+      del state.annotations[branch]
+
+    self._save_state(name, state)
+    print(f"Removed {bold(branch)} from stack (children re-parented)")
+
+  def cmd_delete(self, args: List[str]) -> None:
+    if not args:
+      raise XtaxException("Usage: git xtax delete <name>")
+
+    name = args[0]
+    stacks = self._storage.list_stacks()
+    if name not in stacks:
+      raise XtaxException(
+        f"Stack {bold(name)} not found. Available stacks: {', '.join(stacks) or '(none)'}")
+
+    self._storage.delete_stack(name)
+    print(f"Deleted stack {bold(name)}")
+
+  def _branch_exists_anywhere(self, branch: LocalBranchShortName) -> bool:
+    """Check if branch exists locally or on remote."""
+    if branch in self._git.get_local_branches():
+      return True
+    result = self._git._popen_git(
+      "rev-parse", "--verify", f"refs/remotes/origin/{branch}", allow_non_zero=True)
+    return result.exit_code == 0
+
+  def _branch_info_str(self, branch: LocalBranchShortName, state: XtaxState,
+                        highlighted: Optional[LocalBranchShortName],
+                        checked_out: Optional[LocalBranchShortName] = None) -> str:
+    deleted_color = "\033[38;2;231;63;63m"
+    is_deleted = not self._branch_exists_anywhere(branch)
+
+    if is_deleted:
+      is_highlighted = branch == highlighted
+      node = "◉" if is_highlighted else "○"
+      return colored(f"{node} {branch}  deleted", deleted_color)
+
+    # Node marker follows highlighted; name color follows checked_out
+    active_color = "\033[38;2;52;235;149m"
+    is_highlighted = branch == highlighted
+    is_checked_out = branch == (checked_out if checked_out is not None else highlighted)
+
+    if is_highlighted:
+      node = "◉"
+      if is_checked_out:
+        branch_str = f"{node} " + colored(bold(str(branch)), active_color)
+      else:
+        branch_str = f"{node} " + bold(str(branch))
+    elif is_checked_out:
+      branch_str = f"{dim('○')} " + colored(str(branch), active_color)
+    else:
+      branch_str = f"{dim('○')} " + str(branch)
+
+    # Annotation
+    anno = ""
+    if branch in state.annotations and state.annotations[branch].formatted_full_text:
+      anno = "  " + state.annotations[branch].formatted_full_text
+
+    # Ahead/behind parent, colored by sync status
+    parent_info = ""
+    parent = state.up_branch_for.get(branch)
+    if parent:
+      try:
+        ahead_behind = self._git._popen_git(
+          "rev-list", "--count", "--left-right",
+          f"{parent}...{branch}", allow_non_zero=True)
+        if ahead_behind.exit_code == 0:
+          parts = ahead_behind.stdout.strip().split('\t')
+          if len(parts) == 2:
+            behind, ahead = parts
+            ahead_str = colored(f"{ahead}↑", AnsiEscapeCodes.GREEN) if ahead != "0" else dim(f"{ahead}↑")
+            behind_str = colored(f"{behind}↓", AnsiEscapeCodes.RED) if behind != "0" else dim(f"{behind}↓")
+            parent_info = f" {dim('(')}{behind_str} {ahead_str}{dim(')')}"
+      except Exception as e:
+        debug(f"Failed to get ahead/behind for {branch} vs {parent}: {e}")
+
+    # Merged indicator: branch had a remote tracking ref that's now gone
+    merged_info = ""
+    try:
+      upstream = self._git._popen_git(
+        "config", f"branch.{branch}.remote", allow_non_zero=True)
+      if upstream.exit_code == 0 and upstream.stdout.strip():
+        remote = upstream.stdout.strip()
+        remote_ref = self._git._popen_git(
+          "rev-parse", "--verify", f"refs/remotes/{remote}/{branch}", allow_non_zero=True)
+        if remote_ref.exit_code != 0:
+          merged_info = "  " + dim("merged")
+    except Exception:
+      pass
+
+    return f"{branch_str}{anno}{parent_info}{merged_info}"
+
+  def _build_view_lines(self, name: str, state: XtaxState,
+                         highlighted: Optional[LocalBranchShortName],
+                         checked_out: Optional[LocalBranchShortName] = None
+                         ) -> List[Tuple[str, Optional[LocalBranchShortName]]]:
+    """Build the view output as a list of (line, branch_or_None) pairs."""
+    lines: List[Tuple[str, Optional[LocalBranchShortName]]] = []
+    lines.append((f"  Stack: {bold(name)}{self._xtax_ahead_behind_str()}", None))
+
+    # Root branch — show ahead/behind vs remote tracking branch
+    root_info = ""
+    try:
+      remote_ref = f"origin/{state.root}"
+      ahead_behind = self._git._popen_git(
+        "rev-list", "--count", "--left-right",
+        f"{remote_ref}...{state.root}", allow_non_zero=True)
+      if ahead_behind.exit_code == 0:
+        parts = ahead_behind.stdout.strip().split('\t')
+        if len(parts) == 2:
+          behind, ahead = parts
+          ahead_str = colored(f"{ahead}↑", AnsiEscapeCodes.GREEN) if ahead != "0" else dim(f"{ahead}↑")
+          behind_str = colored(f"{behind}↓", AnsiEscapeCodes.RED) if behind != "0" else dim(f"{behind}↓")
+          root_info = f" {dim('(')}{behind_str} {ahead_str}{dim(')')}"
+    except Exception as e:
+      debug(f"Failed to get ahead/behind for root {state.root}: {e}")
+    lines.append((f"  {dim('○')} {dim(str(state.root))}{root_info}", None))
+
+    root_children = state.down_branches_for.get(state.root, [])
+    if not root_children:
+      return lines
+
+    active_spines: set = set()
+
+    def spine_prefix(depth: int) -> str:
+      parts = []
+      for d in range(depth):
+        if d in active_spines:
+          parts.append(dim("│") + " ")
+        else:
+          parts.append("  ")
+      return ''.join(parts)
+
+    def collect_node(branch: LocalBranchShortName, depth: int) -> None:
+      if depth > 0:
+        lines.append((f"  {spine_prefix(depth).rstrip()}", None))
+
+      info = self._branch_info_str(branch, state, highlighted, checked_out)
+      lines.append((f"  {spine_prefix(depth)}{info}", branch))
+
+      children = state.down_branches_for.get(branch, [])
+      if children:
+        active_spines.add(depth)
+        for child in children:
+          collect_node(child, depth + 1)
+        active_spines.discard(depth)
+
+    active_spines.add(0)
+    for child in root_children:
+      collect_node(child, 1)
+    active_spines.discard(0)
+
+    return lines
+
+  def _read_key(self) -> str:
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+      tty.setraw(fd)
+      ch = os.read(fd, 1)
+      if ch == b'\x1b':
+        import select as _select
+        if _select.select([fd], [], [], 0.1)[0]:
+          ch2 = os.read(fd, 1)
+          if ch2 == b'[':
+            ch3 = os.read(fd, 1)
+            return {b'A': 'up', b'B': 'down'}.get(ch3, '')
+        else:
+          return 'escape'
+      elif ch in (b'\r', b'\n'):
+        return 'enter'
+      elif ch == b'\x03':
+        return 'ctrl-c'
+      elif ch == b'k':
+        return 'up'
+      elif ch == b'j':
+        return 'down'
+      elif ch == b'q':
+        return 'ctrl-c'
+      elif ch == b'a':
+        return 'append'
+      elif ch == b'p':
+        return 'prepend'
+      elif ch == b'd':
+        return 'delete'
+      elif ch == b'r':
+        return 'rename'
+      return ''
+    finally:
+      termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+  def _exit_interactive(self, num_lines: int) -> None:
+    """Clear interactive display and restore cursor."""
+    if num_lines > 1:
+      sys.stdout.write(f"\x1b[{num_lines - 1}A")
+    sys.stdout.write('\r\x1b[J')
+    sys.stdout.write('\x1b[?25h')
+    sys.stdout.flush()
+
+  def cmd_list(self, args: List[str]) -> None:
+    return self._cmd_view_all(args)
+
+  def _print_view(self) -> None:
+    """Print static (non-interactive) stack view."""
+    name, state = self._resolve_current_stack()
+    current = self._git.get_currently_checked_out_branch_or_none()
+    for line, _ in self._build_view_lines(name, state, current):
+      print(line)
+
+  def cmd_view(self, args: List[str], stack_name: Optional[str] = None) -> Optional[str]:
+    if stack_name:
+      content = self._storage.read_stack_definition(stack_name)
+      if content is None:
+        raise XtaxException(f"Stack {bold(stack_name)} not found")
+      name = stack_name
+      state = StackStorage.parse_definition(content)
+    else:
+      name, state = self._resolve_current_stack()
+    current = self._git.get_currently_checked_out_branch_or_none()
+
+    if not sys.stdin.isatty():
+      for line, _ in self._build_view_lines(name, state, current):
+        print(line)
+      return
+
+    managed = state.managed_branches
+    if not managed:
+      if not sys.stdin.isatty():
+        for line, _ in self._build_view_lines(name, state, current):
+          print(line)
+        return
+      # Empty stack — show view with hint, allow append
+      hint = dim("  a: append first branch")
+      lines = self._build_view_lines(name, state, current)
+      num_lines = len(lines) + 1
+      sys.stdout.write('\x1b[?25l')
+      sys.stdout.write('\n'.join(line for line, _ in lines) + '\n' + hint)
+      sys.stdout.flush()
+      try:
+        while True:
+          key = self._read_key()
+          if key == 'append':
+            self._exit_interactive(num_lines)
+            root = state.root
+            branch_name = input(rl_safe(f"Enter branch name to add to {bold(name)}: ")).strip()
+            if branch_name:
+              try:
+                self.cmd_append([branch_name, f'--onto={root}'], stack_name=name)
+              except XtaxException as e:
+                print(f"Error: {e}")
+            # Re-enter cmd_view to show updated state
+            return self.cmd_view(args, stack_name=stack_name)
+          elif key == 'escape':
+            self._exit_interactive(num_lines)
+            return 'back'
+          elif key in ('ctrl-c', 'enter'):
+            self._exit_interactive(num_lines)
+            for line, _ in lines:
+              print(line)
+            return
+      except Exception:
+        sys.stdout.write('\x1b[?25h')
+        sys.stdout.flush()
+        raise
+
+    cursor = 0
+    if current and current in managed:
+      cursor = managed.index(current)
+
+    while True:
+      # Refresh state each iteration (actions may have changed it)
+      if stack_name:
+        content = self._storage.read_stack_definition(stack_name)
+        if content is None:
+          return
+        name = stack_name
+        state = StackStorage.parse_definition(content)
+      else:
+        name, state = self._resolve_current_stack()
+      current = self._git.get_currently_checked_out_branch_or_none()
+      managed = state.managed_branches
+      if not managed:
+        for line, _ in self._build_view_lines(name, state, current):
+          print(line)
+        return
+      cursor = min(cursor, len(managed) - 1)
+
+      hint = dim("  a: append  p: prepend  r: rename  d: remove")
+
+      def render_lines(cursor_idx: int) -> List[str]:
+        highlighted = managed[cursor_idx]
+        lines = self._build_view_lines(name, state, highlighted, checked_out=current)
+        return [line for line, _ in lines] + [hint]
+
+      num_lines = len(self._build_view_lines(name, state, current)) + 1
+      sys.stdout.write('\x1b[?25l')
+
+      def draw(cursor_idx: int) -> None:
+        out = render_lines(cursor_idx)
+        for i, line in enumerate(out):
+          sys.stdout.write(f'\r\x1b[K{line}')
+          if i < len(out) - 1:
+            sys.stdout.write('\n')
+        sys.stdout.flush()
+
+      def move_to_top() -> None:
+        if num_lines > 1:
+          sys.stdout.write(f"\x1b[{num_lines - 1}A")
+
+      draw(cursor)
+
+      action = None
+      try:
+        while True:
+          key = self._read_key()
+          if key == 'up' and cursor > 0:
+            cursor -= 1
+          elif key == 'down' and cursor < len(managed) - 1:
+            cursor += 1
+          elif key == 'enter':
+            selected = managed[cursor]
+            if not self._branch_exists_anywhere(selected):
+              continue
+            self._exit_interactive(num_lines)
+            if selected != current:
+              self._git.checkout(selected)
+            for line, _ in self._build_view_lines(name, state, selected):
+              print(line)
+            return
+          elif key == 'escape':
+            self._exit_interactive(num_lines)
+            return 'back'
+          elif key == 'ctrl-c':
+            self._exit_interactive(num_lines)
+            for line, _ in self._build_view_lines(name, state, current):
+              print(line)
+            return
+          elif key in ('append', 'prepend', 'delete', 'rename'):
+            action = key
+            self._exit_interactive(num_lines)
+            break
+          else:
+            continue
+
+          move_to_top()
+          draw(cursor)
+      except Exception:
+        sys.stdout.write('\x1b[?25h')
+        sys.stdout.flush()
+        raise
+
+      # Handle actions outside interactive mode
+      selected_branch = managed[cursor]
+      if action == 'append':
+        branch_name = input(rl_safe(f"Enter branch name to add after {bold(selected_branch)}: ")).strip()
+        if branch_name:
+          try:
+            self.cmd_append([branch_name, f'--onto={selected_branch}'])
+          except XtaxException as e:
+            print(f"Error: {e}")
+      elif action == 'prepend':
+        branch_name = input(rl_safe(f"Enter branch name to add before {bold(selected_branch)}: ")).strip()
+        if branch_name:
+          try:
+            # Checkout selected branch so prepend works relative to it
+            if current != selected_branch:
+              self._git.checkout(selected_branch)
+            self.cmd_prepend([branch_name])
+          except XtaxException as e:
+            print(f"Error: {e}")
+          finally:
+            # Restore original checkout
+            if current and current != selected_branch:
+              self._git.checkout(current)
+      elif action == 'delete':
+        confirm = input(rl_safe(f"Remove {bold(selected_branch)} from stack? [y/N] ")).strip()
+        if confirm.lower() in ('y', 'yes'):
+          try:
+            self.cmd_slideout([str(selected_branch)], stack_name=name)
+          except XtaxException as e:
+            print(f"Error: {e}")
+      elif action == 'rename':
+        new_name = input(rl_safe(f"Rename {bold(selected_branch)} to: ")).strip()
+        if new_name:
+          try:
+            self.cmd_rename_branch([str(selected_branch), new_name])
+          except XtaxException as e:
+            print(f"Error: {e}")
+
+      # Loop back to re-render interactive view
+
+  def cmd_up(self, args: List[str]) -> None:
+    name, state = self._resolve_current_stack()
+    current = self._current_branch()
+    if current not in state.managed_branches:
+      raise XtaxException(f"Branch {bold(current)} is not in the stack")
+    parent = state.up_branch_for.get(current)
+    if not parent or parent == state.root:
+      raise XtaxException(f"Branch {bold(current)} is at the top of the stack")
+    self._git.checkout(parent)
+    self._print_view()
+
+  def cmd_down(self, args: List[str]) -> None:
+    name, state = self._resolve_current_stack()
+    current = self._current_branch()
+    if current not in state.managed_branches:
+      raise XtaxException(f"Branch {bold(current)} is not in the stack")
+    children = state.down_branches_for.get(current, [])
+    if not children:
+      raise XtaxException(f"Branch {bold(current)} has no children")
+    self._git.checkout(children[0])
+    self._print_view()
+
+  def cmd_top(self, args: List[str]) -> None:
+    name, state = self._resolve_current_stack()
+    root_children = state.down_branches_for.get(state.root, [])
+    if not root_children:
+      raise XtaxException("Stack has no branches")
+    target = root_children[0]
+    self._git.checkout(target)
+    self._print_view()
+
+  def cmd_bottom(self, args: List[str]) -> None:
+    name, state = self._resolve_current_stack()
+    root_children = state.down_branches_for.get(state.root, [])
+    if not root_children:
+      raise XtaxException("Stack has no branches")
+    # Follow first children to the deepest leaf
+    target = root_children[0]
+    while True:
+      children = state.down_branches_for.get(target, [])
+      if not children:
+        break
+      target = children[0]
+    self._git.checkout(target)
+    self._print_view()
+
+  def cmd_go_n(self, n: int) -> None:
+    """Navigate by integer. Positive = up N, negative = down N, 0 = first branch."""
+    name, state = self._resolve_current_stack()
+    current = self._current_branch()
+    if current not in state.managed_branches:
+      raise XtaxException(f"Branch {bold(current)} is not in the stack")
+
+    if n == 0:
+      # Go to first branch in stack (first child of root)
+      root_children = state.down_branches_for.get(state.root, [])
+      if not root_children:
+        raise XtaxException("Stack has no branches")
+      target = root_children[0]
+      self._git.checkout(target)
+      self._print_view()
+      return
+
+    if n > 0:
+      target = current
+      for _ in range(n):
+        parent = state.up_branch_for.get(target)
+        if not parent or parent == state.root:
+          raise XtaxException(
+            f"Cannot go {n} up from {bold(current)} - "
+            f"reached top of stack at {bold(target)}")
+        target = parent
+    else:
+      target = current
+      for _ in range(-n):
+        children = state.down_branches_for.get(target, [])
+        if not children:
+          raise XtaxException(
+            f"Cannot go {-n} down from {bold(current)} - "
+            f"reached leaf at {bold(target)}")
+        target = children[0]
+
+    self._git.checkout(target)
+    self._print_view()
+
+  def cmd_sync(self, args: List[str]) -> None:
+    self._fetch_stacks()
+    is_continue = '--continue' in args
+    is_current_only = '--current' in args
+
+    if is_continue:
+      self._sync_continue()
+      return
+
+    name, state = self._resolve_current_stack()
+    current = self._current_branch()
+
+    print("Fetching from origin...")
+    self._git.fetch_remote('origin')
+
+    # Fast-forward root branch if possible
+    root = state.root
+    remote_root = f'origin/{root}'
+    has_remote_root = self._git._popen_git(
+      'rev-parse', '--verify', remote_root, allow_non_zero=True).exit_code == 0
+    if has_remote_root:
+      ff_result = self._git._popen_git(
+        'merge-base', '--is-ancestor', str(root), remote_root, allow_non_zero=True)
+      if ff_result.exit_code == 0:
+        # Local root is behind or equal — safe to fast-forward
+        self._git._popen_git('update-ref', f'refs/heads/{root}',
+                             self._git._popen_git('rev-parse', remote_root).stdout.strip())
+        print(f"Fast-forwarded {bold(root)} to {bold(remote_root)}")
+      else:
+        # Local root has commits not on remote
+        print(colored(
+          f"Warning: {bold(root)} has local commits not on remote — skipping fast-forward",
+          AnsiEscapeCodes.YELLOW))
+
+    if is_current_only:
+      if current not in state.managed_branches:
+        raise XtaxException(f"Branch {bold(current)} is not in the stack")
+      branches_to_sync = self._get_dfs_order(state, current)
+    else:
+      # Sync entire stack from root's children
+      branches_to_sync: List[LocalBranchShortName] = []
+      root_children = state.down_branches_for.get(state.root, [])
+      for child in root_children:
+        branches_to_sync.extend(self._get_dfs_order(state, child))
+
+    self._sync_branches(name, state, branches_to_sync, start_index=0,
+                        original_branch=str(current))
+
+    currently_on = self._git.get_currently_checked_out_branch_or_none()
+    if currently_on != current:
+      print(f"\nRestoring checkout to {bold(current)}...")
+      self._git.checkout(current)
+
+  def _get_dfs_order(self, state: XtaxState, start: LocalBranchShortName) -> List[LocalBranchShortName]:
+    result: List[LocalBranchShortName] = [start]
+
+    def dfs(branch: LocalBranchShortName) -> None:
+      for child in state.down_branches_for.get(branch, []):
+        result.append(child)
+        dfs(child)
+
+    dfs(start)
+    return result
+
+  def _sync_branches(self, stack_name: str, state: XtaxState,
+                     branches: List[LocalBranchShortName], start_index: int,
+                     original_branch: Optional[str] = None) -> None:
+    gitlab_client = self._get_gitlab_client()
+
+    for i in range(start_index, len(branches)):
+      branch = branches[i]
+      parent = state.up_branch_for.get(branch)
+
+      if not parent:
+        print(f"\n{bold(branch)} (no parent - skipping rebase)")
+        continue
+
+      print(f"\nRebasing {bold(branch)} onto {bold(parent)}...")
+
+      self._storage.save_sync_state({
+        'stack_name': stack_name,
+        'branches': [str(b) for b in branches],
+        'current_index': i,
+        'original_branch': original_branch,
+      })
+
+      try:
+        remote_parent_ref = f'origin/{parent}'
+        has_remote_parent = self._git._popen_git(
+          'rev-parse', '--verify', remote_parent_ref,
+          allow_non_zero=True
+        ).exit_code == 0
+
+        if has_remote_parent:
+          self._git.rebase_onto(
+            AnyRevision.of(str(parent)),
+            AnyRevision.of(remote_parent_ref),
+            branch,
+          )
+        else:
+          # No remote parent — use local parent as upstream
+          self._git.rebase_onto(
+            AnyRevision.of(str(parent)),
+            AnyRevision.of(str(parent)),
+            branch,
+          )
+      except UnderlyingGitException:
+        print(colored(
+          f"\nConflict while rebasing {bold(branch)} onto {bold(parent)}.\n"
+          f"Resolve the conflict, then run: git xtax sync --continue",
+          AnsiEscapeCodes.RED
+        ))
+        return
+
+      print(f"Pushing {bold(branch)}...")
+      try:
+        self._git.push('origin', branch, force_with_lease=True)
+      except UnderlyingGitException as e:
+        warn(f"Failed to push {bold(branch)}: {e}")
+
+      # Create or update MR
+      if gitlab_client and parent:
+        try:
+          self._ensure_mr(gitlab_client, branch, parent, state, stack_name)
+        except Exception as e:
+          warn(f"Failed to create/update MR for {bold(branch)}: {e}")
+
+    self._storage.clear_sync_state()
+
+    # Push stack metadata
+    try:
+      self._storage.push_stacks()
+      print(f"Pushed stack metadata to origin")
+    except Exception as e:
+      warn(f"Failed to push stack metadata: {e}")
+
+    print(f"\n{fmt('<green><b>Sync complete!</b></green>')}")
+
+  def _sync_continue(self) -> None:
+    sync_state = self._storage.load_sync_state()
+    if not sync_state:
+      raise XtaxException("No sync in progress. Nothing to continue.")
+
+    stack_name = sync_state['stack_name']
+    branches = [LocalBranchShortName.of(b) for b in sync_state['branches']]
+    current_index = sync_state['current_index']
+    original_branch = sync_state.get('original_branch')
+
+    content = self._storage.read_stack_definition(stack_name)
+    if content is None:
+      raise XtaxException(f"Stack {bold(stack_name)} not found")
+    state = StackStorage.parse_definition(content)
+
+    git_dir = self._git.get_current_worktree_git_dir()
+    rebase_in_progress = (
+      os.path.isdir(os.path.join(git_dir, 'rebase-merge')) or
+      os.path.isdir(os.path.join(git_dir, 'rebase-apply'))
+    )
+
+    if rebase_in_progress:
+      raise XtaxException(
+        "A rebase is still in progress. Complete it first with "
+        "`git rebase --continue`, then run `git xtax sync --continue`.")
+
+    branch = branches[current_index]
+    print(f"Pushing {bold(branch)} after conflict resolution...")
+    try:
+      self._git.push('origin', branch, force_with_lease=True)
+    except UnderlyingGitException as e:
+      warn(f"Failed to push {bold(branch)}: {e}")
+
+    self._sync_branches(stack_name, state, branches, start_index=current_index + 1,
+                        original_branch=original_branch)
+
+    if original_branch:
+      currently_on = self._git.get_currently_checked_out_branch_or_none()
+      target = LocalBranchShortName.of(original_branch)
+      if currently_on != target:
+        print(f"\nRestoring checkout to {bold(target)}...")
+        self._git.checkout(target)
+
+  def cmd_push(self, args: List[str]) -> None:
+    remote = 'origin'
+    for arg in args:
+      if arg.startswith('--remote='):
+        remote = arg[len('--remote='):]
+
+    # Check if resuming after conflict resolution
+    push_state = self._storage.load_push_state()
+    if push_state:
+      self._storage.push_stacks(remote)
+      original = push_state.get('original_branch')
+      self._storage.clear_push_state()
+      if original:
+        self._git.checkout(LocalBranchShortName.of(original))
+        print(f"Pushed stacks to {remote}, restored checkout to {original}")
+      else:
+        print(f"Pushed stacks to {remote}")
+      return
+
+    # Normal push: fetch + rebase if needed
+    result = self._storage.fetch_and_fast_forward(remote)
+
+    if result in (None, 'created', 'updated', 'ahead'):
+      self._storage.push_stacks(remote)
+      print(f"Pushed stacks to {remote}")
+      return
+
+    # Diverged — need to rebase
+    current = self._git.get_currently_checked_out_branch_or_none()
+    self._storage.save_push_state({
+      'original_branch': str(current) if current else None
+    })
+
+    subprocess.run(['git', 'checkout', '_xtax'], check=True)
+    rebase_result = subprocess.run(['git', 'rebase', f'{remote}/_xtax'])
+
+    if rebase_result.returncode != 0:
+      print("Rebase conflict on _xtax. Resolve conflicts, then run:")
+      print("  git rebase --continue")
+      print("  gx push")
+      return
+
+    # Rebase succeeded — push and restore
+    self._storage.push_stacks(remote)
+    self._storage.clear_push_state()
+    if current:
+      self._git.checkout(current)
+    print(f"Pushed stacks to {remote}")
+
+  def cmd_fetch(self, args: List[str]) -> None:
+    remote = 'origin'
+    for arg in args:
+      if arg.startswith('--remote='):
+        remote = arg[len('--remote='):]
+
+    result = self._storage.fetch_and_fast_forward(remote)
+    subprocess.run(['git', 'remote', 'prune', remote], capture_output=True)
+    if result == 'created':
+      print(f"Created local stacks from {remote}")
+    elif result == 'updated':
+      print(f"Fetched stacks from {remote}")
+    elif result == 'ahead':
+      print(f"Local stacks are ahead of {remote} (nothing to fetch)")
+    elif result == 'diverged':
+      print(f"Local and remote stacks have diverged. Run `gx push` to rebase and sync.")
+    else:
+      print(f"Stacks already up to date with {remote}")
+
+  def _cmd_view_all(self, args: List[str]) -> None:
+    while True:
+      current_stack = None
+      try:
+        current = self._git.get_currently_checked_out_branch_or_none()
+        if current:
+          current_stack = self._storage.find_stack_for_branch(current)
+      except Exception:
+        pass
+
+      stacks = self._storage.list_stacks()
+      if not stacks:
+        print("No stacks defined. Use `git xtax init <name> <branch>` to create one.")
+        return
+
+      if not sys.stdin.isatty():
+        self._print_stack_list(stacks, current_stack)
+        return
+
+      action, name = self._interactive_stack_select(stacks, current_stack)
+
+      if action == 'select':
+        result = self.cmd_view([], stack_name=name)
+        if result == 'back':
+          continue  # Go back to stack list
+        return
+      elif action == 'delete':
+        confirm = input(rl_safe(f"Delete stack {bold(name)}? [y/N] ")).strip()
+        if confirm.lower() in ('y', 'yes'):
+          try:
+            self.cmd_delete([name])
+          except XtaxException as e:
+            print(f"Error: {e}")
+        # Loop back to re-render
+      elif action == 'rename':
+        new_name = input(rl_safe(f"Rename stack {bold(name)} to: ")).strip()
+        if new_name:
+          try:
+            self.cmd_rename([name, new_name])
+          except XtaxException as e:
+            print(f"Error: {e}")
+        # Loop back to re-render
+
+  def _xtax_ahead_behind_str(self) -> str:
+    """Get ahead/behind string for _xtax branch."""
+    try:
+      remote_check = self._git._popen_git(
+        "rev-parse", "--verify", "origin/_xtax", allow_non_zero=True)
+      if remote_check.exit_code == 0:
+        ahead_behind = self._git._popen_git(
+          "rev-list", "--count", "--left-right",
+          "origin/_xtax..._xtax", allow_non_zero=True)
+        if ahead_behind.exit_code == 0:
+          parts = ahead_behind.stdout.strip().split('\t')
+          if len(parts) == 2:
+            behind, ahead = parts
+            ahead_str = colored(f"{ahead}↑", AnsiEscapeCodes.GREEN) if ahead != "0" else dim(f"{ahead}↑")
+            behind_str = colored(f"{behind}↓", AnsiEscapeCodes.RED) if behind != "0" else dim(f"{behind}↓")
+            return f" {dim('(')}{behind_str} {ahead_str}{dim(')')}"
+      else:
+        # No remote — count all local commits as ahead
+        count = self._git._popen_git(
+          "rev-list", "--count", "_xtax", allow_non_zero=True)
+        if count.exit_code == 0:
+          ahead = count.stdout.strip()
+          ahead_str = colored(f"{ahead}↑", AnsiEscapeCodes.GREEN) if ahead != "0" else dim(f"{ahead}↑")
+          behind_str = dim("0↓")
+          return f" {dim('(')}{behind_str} {ahead_str}{dim(')')}"
+    except Exception as e:
+      debug(f"Failed to get ahead/behind for _xtax: {e}")
+    return ""
+
+  def _print_stack_list(self, stacks: List[str],
+                         current_stack: Optional[str]) -> None:
+    """Print static stack list (non-interactive)."""
+    roots: Dict[str, List[str]] = {}
+    for s in stacks:
+      content = self._storage.read_stack_definition(s)
+      if content:
+        state = StackStorage.parse_definition(content)
+        root = str(state.root)
+      else:
+        root = "?"
+      roots.setdefault(root, []).append(s)
+
+    print(f"  {dim('_xtax')}{self._xtax_ahead_behind_str()}")
+
+    active_color = "\033[38;2;52;235;149m"
+    for root, stack_names in roots.items():
+      print(f"  {dim(root)}")
+      for s in stack_names:
+        if s == current_stack:
+          node = colored("◉", active_color)
+          name_str = colored(bold(s), active_color)
+        else:
+          node = dim("○")
+          name_str = s
+        print(f"  {dim('│')} {node} {name_str}")
+
+  def _interactive_stack_select(self, stacks: List[str],
+                                 current_stack: Optional[str]
+                                 ) -> Tuple[str, Optional[str]]:
+    """Arrow-key selector for stacks, grouped by root branch.
+    Returns (action, stack_name) where action is 'select' or 'delete'."""
+    roots: Dict[str, List[str]] = {}
+    for s in stacks:
+      content = self._storage.read_stack_definition(s)
+      if content:
+        state = StackStorage.parse_definition(content)
+        root = str(state.root)
+      else:
+        root = "?"
+      roots.setdefault(root, []).append(s)
+
+    entries: List[Tuple[Optional[str], Optional[str]]] = []
+    entries.append(('__xtax_header__', None))
+    for root, stack_names in roots.items():
+      entries.append((root, None))
+      for s in stack_names:
+        entries.append((None, s))
+
+    selectable = [i for i, (_, name) in enumerate(entries) if name is not None]
+    if not selectable:
+      raise XtaxException("No stacks available")
+
+    cursor = 0
+    if current_stack:
+      for idx, sel_i in enumerate(selectable):
+        if entries[sel_i][1] == current_stack:
+          cursor = idx
+          break
+
+    active_color = "\033[38;2;52;235;149m"
+    xtax_info = self._xtax_ahead_behind_str()
+
+    def render(cursor_idx: int) -> str:
+      highlighted = entries[selectable[cursor_idx]][1]
+      out = []
+      for root_name, stack_name in entries:
+        if root_name == '__xtax_header__':
+          out.append(f"  {dim('_xtax')}{xtax_info}")
+        elif root_name is not None:
+          out.append(f"  {dim(root_name)}")
+        else:
+          is_active = stack_name == current_stack
+          if stack_name == highlighted:
+            node = "◉"
+            name_str = colored(bold(stack_name), active_color) if is_active else bold(stack_name)
+          else:
+            node = dim("○")
+            name_str = colored(stack_name, active_color) if is_active else stack_name
+          out.append(f"  {dim('│')} {node} {name_str}")
+      out.append(dim("  r: rename  d: delete"))
+      return '\n'.join(out)
+
+    num_lines = len(entries) + 1
+    sys.stdout.write('\x1b[?25l')
+
+    def draw(cursor_idx: int) -> None:
+      sys.stdout.write('\r')
+      sys.stdout.write('\x1b[J')
+      sys.stdout.write(render(cursor_idx))
+      sys.stdout.flush()
+
+    def move_to_top() -> None:
+      if num_lines > 1:
+        sys.stdout.write(f"\x1b[{num_lines - 1}A")
+
+    draw(cursor)
+
+    try:
+      while True:
+        key = self._read_key()
+        if key == 'up' and cursor > 0:
+          cursor -= 1
+        elif key == 'down' and cursor < len(selectable) - 1:
+          cursor += 1
+        elif key == 'enter':
+          selected = entries[selectable[cursor]][1]
+          self._exit_interactive(num_lines)
+          return ('select', selected)
+        elif key == 'ctrl-c':
+          self._exit_interactive(num_lines)
+          raise InteractionStopped()
+        elif key == 'delete':
+          selected = entries[selectable[cursor]][1]
+          self._exit_interactive(num_lines)
+          return ('delete', selected)
+        elif key == 'rename':
+          selected = entries[selectable[cursor]][1]
+          self._exit_interactive(num_lines)
+          return ('rename', selected)
+        else:
+          continue
+
+        move_to_top()
+        draw(cursor)
+    except Exception:
+      sys.stdout.write('\x1b[?25h')
+      sys.stdout.flush()
+      raise
+
+  def cmd_switch(self, args: List[str]) -> None:
+    if not args:
+      stacks = self._storage.list_stacks()
+      if not stacks:
+        raise XtaxException("No stacks defined. Use `git xtax init <name> <branch>` to create one.")
+      current_stack = None
+      try:
+        current = self._git.get_currently_checked_out_branch_or_none()
+        if current:
+          current_stack = self._storage.find_stack_for_branch(current)
+      except Exception:
+        pass
+      action, name = self._interactive_stack_select(stacks, current_stack)
+      if action != 'select':
+        return
+    else:
+      name = args[0]
+    stacks = self._storage.list_stacks()
+    if name not in stacks:
+      raise XtaxException(
+        f"Stack {bold(name)} not found. Available stacks: {', '.join(stacks) or '(none)'}")
+
+    content = self._storage.read_stack_definition(name)
+    if content is None:
+      raise XtaxException(f"Stack {bold(name)} not found")
+    state = StackStorage.parse_definition(content)
+
+    # Checkout first branch in the stack
+    target = None
+    for b in state.managed_branches:
+      if self._branch_exists_anywhere(b):
+        target = b
+        break
+    if target:
+      self._git.checkout(target)
+      print(f"Switched to stack {bold(name)}, checked out {bold(target)}")
+    else:
+      raise XtaxException(f"Stack {bold(name)} has no existing branches")
+
+  def cmd_edit(self, args: List[str]) -> None:
+    name, state = self._resolve_current_stack()
+    editor = os.environ.get('XTAX_EDITOR') or os.environ.get('VISUAL') or os.environ.get('EDITOR') or 'vi'
+
+    import tempfile
+    content = StackStorage.render_definition(state)
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.xtax', delete=False) as f:
+      f.write(content)
+      tmp_path = f.name
+
+    try:
+      exit_code = subprocess.call(shlex.split(editor) + [tmp_path])
+      if exit_code != 0:
+        raise XtaxException(f"Editor exited with code {exit_code}")
+      with open(tmp_path, 'r') as f:
+        new_content = f.read()
+      StackStorage.parse_definition(new_content)
+      self._storage.write_stack_definition(name, new_content)
+      print(f"Updated stack {bold(name)}")
+    finally:
+      os.unlink(tmp_path)
+
+  def cmd_rename(self, args: List[str]) -> None:
+    if len(args) < 2:
+      raise XtaxException("Usage: git xtax rename <old-name> <new-name>")
+
+    old_name = args[0]
+    new_name = args[1]
+
+    content = self._storage.read_stack_definition(old_name)
+    if content is None:
+      raise XtaxException(f"Stack {bold(old_name)} does not exist")
+
+    if self._storage.read_stack_definition(new_name) is not None:
+      raise XtaxException(f"Stack {bold(new_name)} already exists")
+
+    self._storage.write_stack_definition(new_name, content)
+    self._storage.delete_stack(old_name)
+    print(f"Renamed stack {bold(old_name)} to {bold(new_name)}")
+
+  def cmd_rename_branch(self, args: List[str]) -> None:
+    if len(args) < 2:
+      raise XtaxException("Usage: git xtax rename-branch <old-branch> <new-branch>")
+
+    old_name = LocalBranchShortName.of(args[0])
+    new_name = LocalBranchShortName.of(args[1])
+
+    # Find which stack this branch belongs to
+    stack_name = self._storage.find_stack_for_branch(old_name)
+    if not stack_name:
+      raise XtaxException(f"Branch {bold(old_name)} is not in any stack")
+
+    # Check new name isn't already in a stack
+    existing = self._storage.find_stack_for_branch(new_name)
+    if existing:
+      raise XtaxException(f"Branch {bold(new_name)} is already in stack {bold(existing)}")
+
+    content = self._storage.read_stack_definition(stack_name)
+    state = StackStorage.parse_definition(content)
+
+    # Rename the git branch
+    result = subprocess.run(['git', 'branch', '-m', str(old_name), str(new_name)],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+      raise XtaxException(f"Failed to rename git branch: {result.stderr.strip()}")
+
+    # Update stack state
+    idx = state.managed_branches.index(old_name)
+    state.managed_branches[idx] = new_name
+
+    if old_name in state.up_branch_for:
+      parent = state.up_branch_for.pop(old_name)
+      state.up_branch_for[new_name] = parent
+      if parent in state.down_branches_for:
+        children = state.down_branches_for[parent]
+        children[children.index(old_name)] = new_name
+
+    if old_name in state.down_branches_for:
+      children = state.down_branches_for.pop(old_name)
+      state.down_branches_for[new_name] = children
+      for child in children:
+        state.up_branch_for[child] = new_name
+
+    if old_name in state.annotations:
+      state.annotations[new_name] = state.annotations.pop(old_name)
+
+    self._save_state(stack_name, state)
+    print(f"Renamed branch {bold(old_name)} to {bold(new_name)} in stack {bold(stack_name)}")
+
+
+# --- Dispatch ---
+
+COMMANDS = {
+  'init': 'cmd_init',
+  'append': 'cmd_append',
+  'a': 'cmd_append',
+  'prepend': 'cmd_prepend',
+  'slideout': 'cmd_slideout',
+  'delete': 'cmd_delete',
+  'rename': 'cmd_rename',
+  'rename-branch': 'cmd_rename_branch',
+  'view': 'cmd_view',
+  'v': 'cmd_view',
+  'up': 'cmd_up',
+  'u': 'cmd_up',
+  'down': 'cmd_down',
+  'd': 'cmd_down',
+  'top': 'cmd_top',
+  't': 'cmd_top',
+  'bottom': 'cmd_bottom',
+  'b': 'cmd_bottom',
+  'list': 'cmd_list',
+  'l': 'cmd_list',
+  'sync': 'cmd_sync',
+  's': 'cmd_sync',
+  'push': 'cmd_push',
+  'fetch': 'cmd_fetch',
+  'switch': 'cmd_switch',
+  'edit': 'cmd_edit',
+}
+
+
+def main() -> None:
+  args = sys.argv[1:]
+
+  if not args or args[0] in ('-h', '--help', 'help', 'h'):
+    print(USAGE)
+    sys.exit(ExitCode.SUCCESS)
+
+  if args[0] in ('--version', 'version'):
+    print(f"git-xtax version {__version__}")
+    sys.exit(ExitCode.SUCCESS)
+
+  if args[0] == 'completions':
+    shell = args[1] if len(args) > 1 else None
+    if shell == 'zsh':
+      print(ZSH_COMPLETION.strip())
+    elif shell == 'bash':
+      print("# Bash completions not yet supported. Contributions welcome!", file=sys.stderr)
+      sys.exit(ExitCode.ARGUMENT_ERROR)
+    else:
+      print("Usage: git xtax completions <zsh|bash>", file=sys.stderr)
+      sys.exit(ExitCode.ARGUMENT_ERROR)
+    sys.exit(ExitCode.SUCCESS)
+
+  debug_mode = False
+  verbose_mode = False
+  remaining_args = []
+  for arg in args:
+    if arg == '--debug':
+      debug_mode = True
+      utils.debug_mode = True
+    elif arg in ('--verbose', '-v'):
+      verbose_mode = True
+      utils.verbose_mode = True
+    else:
+      remaining_args.append(arg)
+  args = remaining_args
+
+  if not args:
+    print(USAGE)
+    sys.exit(ExitCode.SUCCESS)
+
+  cmd = args[0]
+  cmd_args = args[1:]
+
+  try:
+    git = GitContext()
+    storage = StackStorage(git)
+    client = XtaxClient(git, storage)
+
+    try:
+      n = int(cmd)
+      client.cmd_go_n(n)
+      sys.exit(ExitCode.SUCCESS)
+    except ValueError:
+      pass
+
+    if cmd in COMMANDS:
+      method = getattr(client, COMMANDS[cmd])
+      method(cmd_args)
+    else:
+      print(f"Unknown command: {cmd}\n", file=sys.stderr)
+      print(USAGE, file=sys.stderr)
+      sys.exit(ExitCode.ARGUMENT_ERROR)
+
+  except XtaxException as e:
+    print(f"Error: {e}", file=sys.stderr)
+    sys.exit(ExitCode.XTAX_EXCEPTION)
+  except UnderlyingGitException as e:
+    print(f"Git error: {e}", file=sys.stderr)
+    sys.exit(ExitCode.XTAX_EXCEPTION)
+  except InteractionStopped:
+    sys.exit(ExitCode.SUCCESS)
+  except KeyboardInterrupt:
+    # Suppress noisy threading shutdown traceback on Python 3.14+
+    os._exit(ExitCode.KEYBOARD_INTERRUPT)
+  except EOFError:
+    sys.exit(ExitCode.END_OF_FILE_SIGNAL)

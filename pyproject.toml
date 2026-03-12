@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "git-xtax"
+version = "0.0.1"
+description = "Stacked diffs tool for git — refs-based, deterministic, shareable"
+requires-python = ">=3.8"
+dependencies = ["pyyaml>=6.0"]
+license = "MIT"
+authors = [
+    { name = "n-d-r-d-g" },
+]
+keywords = ["git", "stacked-diffs", "rebase"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+]
+
+[project.scripts]
+git-xtax = "git_xtax.bin:main"
+
+[project.urls]
+Homepage = "https://github.com/n-d-r-d-g/git-xtax"
+
+[tool.setuptools.packages.find]
+include = ["git_xtax*"]
