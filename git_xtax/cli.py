@@ -1484,7 +1484,7 @@ class XtaxClient:
           selected = entries[selectable[cursor]][1]
           self._exit_interactive(num_lines)
           return ('select', selected)
-        elif key == 'ctrl-c':
+        elif key in ('ctrl-c', 'escape'):
           self._exit_interactive(num_lines)
           raise InteractionStopped()
         elif key == 'delete':
