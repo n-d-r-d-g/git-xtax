@@ -52,7 +52,7 @@ usage: git xtax <command> [<args>]
 {bold('Sync & share:')}
   s, sync [--current] [--continue]      Rebase + push entire stack (--current: from current branch down)
   push                                  Push stacks to remote
-  fetch                                 Fetch stacks from remote
+  pull                                  Pull stacks from remote
 
 {bold('General:')}
   completions <shell>                   Print shell completion script (zsh, bash)
@@ -91,7 +91,7 @@ _git-xtax() {
     's:Rebase and push entire stack'
     'sync:Rebase and push entire stack'
     'push:Push stacks to remote'
-    'fetch:Fetch stacks from remote'
+    'pull:Pull stacks from remote'
     'completions:Print shell completion script'
     'help:Show help'
     'version:Show version'
@@ -1284,7 +1284,7 @@ class XtaxClient:
       self._git.checkout(current)
     print(f"Pushed stacks to {remote}")
 
-  def cmd_fetch(self, args: List[str]) -> None:
+  def cmd_pull(self, args: List[str]) -> None:
     remote = 'origin'
     for arg in args:
       if arg.startswith('--remote='):
@@ -1295,9 +1295,9 @@ class XtaxClient:
     if result == 'created':
       print(f"Created local stacks from {remote}")
     elif result == 'updated':
-      print(f"Fetched stacks from {remote}")
+      print(f"Pulled stacks from {remote}")
     elif result == 'ahead':
-      print(f"Local stacks are ahead of {remote} (nothing to fetch)")
+      print(f"Local stacks are ahead of {remote} (nothing to pull)")
     elif result == 'diverged':
       print(f"Local and remote stacks have diverged. Run `gx push` to rebase and sync.")
     else:
@@ -1660,7 +1660,7 @@ COMMANDS = {
   'sync': 'cmd_sync',
   's': 'cmd_sync',
   'push': 'cmd_push',
-  'fetch': 'cmd_fetch',
+  'pull': 'cmd_pull',
   'switch': 'cmd_switch',
   'edit': 'cmd_edit',
 }

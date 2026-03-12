@@ -408,7 +408,7 @@ class TestCompletions:
         result = run_xtax("completions", "zsh", cwd=git_repo)
         for cmd in ["init", "append", "prepend", "slideout", "delete", "edit", "switch",
                      "view", "list", "up", "down",
-                     "top", "bottom", "sync", "push", "fetch"]:
+                     "top", "bottom", "sync", "push", "pull"]:
             assert cmd in result.stdout, f"Missing command '{cmd}' in completions"
 
     def test_bash_completions_not_supported(self, git_repo):
