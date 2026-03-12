@@ -2,8 +2,10 @@
 
 xtax is a forge-agnostic* git extension for stacking built on top of [git-machete](https://github.com/VirtusLab/git-machete).
 
-> [!NOTE] What we mean by forge-agnostic: 
-> We use the adapter pattern to support multiple forges However, we currently only have an adapter for GitLab. We plan to add support for more forges in the future.
+> [!NOTE]
+> **What we mean by forge-agnostic:**
+>
+> We use the adapter pattern to support multiple forges. However, we currently only have an adapter for GitLab. We plan to add support for more forges in the future.
 
 ## Storing stacks in an orphan branch
 
