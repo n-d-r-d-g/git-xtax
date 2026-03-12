@@ -1,11 +1,17 @@
 import io
 import os
-import readline  # noqa: F401 — enables line editing in input()
+try:
+  import readline  # noqa: F401 — enables line editing in input()
+except ImportError:
+  pass  # readline is not available on Windows
 import shlex
 import subprocess
 import sys
-import tty
-import termios
+if sys.platform == 'win32':
+  import msvcrt
+else:
+  import tty
+  import termios
 from typing import Dict, List, NoReturn, Optional, Tuple
 
 from git_xtax import __version__, utils
@@ -713,6 +719,39 @@ class XtaxClient:
     return lines
 
   def _read_key(self) -> str:
+    if sys.platform == 'win32':
+      return self._read_key_windows()
+    return self._read_key_unix()
+
+  def _read_key_windows(self) -> str:
+    ch = msvcrt.getwch()
+    if ch in ('\x00', '\xe0'):
+      # Special key — read the second byte
+      ch2 = msvcrt.getwch()
+      return {'H': 'up', 'P': 'down'}.get(ch2, '')
+    elif ch == '\x1b':
+      return 'escape'
+    elif ch in ('\r', '\n'):
+      return 'enter'
+    elif ch == '\x03':
+      return 'ctrl-c'
+    elif ch == 'k':
+      return 'up'
+    elif ch == 'j':
+      return 'down'
+    elif ch == 'q':
+      return 'ctrl-c'
+    elif ch == 'a':
+      return 'append'
+    elif ch == 'p':
+      return 'prepend'
+    elif ch == 'd':
+      return 'delete'
+    elif ch == 'r':
+      return 'rename'
+    return ''
+
+  def _read_key_unix(self) -> str:
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:
@@ -1666,7 +1705,24 @@ COMMANDS = {
 }
 
 
+def _enable_ansi_on_windows() -> None:
+  """Enable ANSI escape sequence processing on Windows 10+."""
+  if sys.platform != 'win32':
+    return
+  try:
+    import ctypes
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    # STD_OUTPUT_HANDLE = -11, ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+    handle = kernel32.GetStdHandle(-11)
+    mode = ctypes.c_ulong()
+    kernel32.GetConsoleMode(handle, ctypes.byref(mode))
+    kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+  except Exception:
+    pass
+
+
 def main() -> None:
+  _enable_ansi_on_windows()
   args = sys.argv[1:]
 
   if not args or args[0] in ('-h', '--help', 'help', 'h'):
