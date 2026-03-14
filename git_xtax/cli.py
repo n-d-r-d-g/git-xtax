@@ -37,8 +37,8 @@ usage: git xtax <command> [<args>]
 
 {bold('Stack management:')}
   init <name> <branch> [--root=<base>]  Create a new stack
-  a, append <branch> [--onto=<parent>]  Append branch below current (or --onto parent)
-  prepend <branch>                      Insert branch above current
+  stack <branch> [--onto=<parent>]      Add branch above current branch (or --onto parent)
+  tuck <branch>                         Add branch below current branch
   slideout <branch>                     Slide branch out of stack
   delete <name>                         Delete a stack
   rename <old> <new>                    Rename a stack
@@ -49,14 +49,17 @@ usage: git xtax <command> [<args>]
 {bold('Navigation:')}
   v, view                               Show the current stack (interactive)
   l, list                               Show all stacks (interactive)
-  u, up                                 Go to parent branch
-  d, down                               Go to child branch
-  t, top                                Go to top branch in stack
-  b, bottom                             Go to bottom branch in stack
-  <N>                                   Go N up (positive) or down (negative); 0 = root
+  u, up                                 Go to child branch (up the stack)
+  d, down                               Go to parent branch (down the stack)
+  t, top                                Go to top (leaf) branch in stack
+  b, bottom                             Go to bottom (first) branch in stack
+  <N>                                   Go N up (positive) or down (negative); 0 = leaf
 
 {bold('Sync & share:')}
-  s, sync [--current] [--continue]      Rebase + push entire stack (--current: from current branch down)
+  s, sync [--current|--cascade] [--continue]
+                                        Rebase + push entire stack
+                                        --current: current branch only
+                                        --cascade: current branch and above
   push                                  Push stacks to remote
   pull                                  Pull stacks from remote
 
@@ -71,9 +74,8 @@ _git-xtax() {
   local -a commands
   commands=(
     'init:Create a new stack'
-    'append:Append branch below current'
-    'a:Append branch below current'
-    'prepend:Insert branch above current'
+    'stack:Add branch above current branch'
+    'tuck:Add branch below current branch'
     'slideout:Slide branch out of stack'
     'delete:Delete a stack'
     'rename:Rename a stack'
@@ -84,15 +86,15 @@ _git-xtax() {
     'list:Show all stacks'
     'l:Show all stacks'
     'view:Show stack tree'
-    'up:Go to parent branch'
-    'u:Go to parent branch'
-    'down:Go to first child branch'
-    'd:Go to first child branch'
-    'top:Go to top branch in stack'
-    't:Go to top branch in stack'
+    'up:Go to child branch (up the stack)'
+    'u:Go to child branch (up the stack)'
+    'down:Go to parent branch (down the stack)'
+    'd:Go to parent branch (down the stack)'
+    'top:Go to top (leaf) branch in stack'
+    't:Go to top (leaf) branch in stack'
     'f:Go to first branch in stack'
-    'bottom:Go to bottom branch in stack'
-    'b:Go to bottom branch in stack'
+    'bottom:Go to bottom (first) branch in stack'
+    'b:Go to bottom (first) branch in stack'
     'l:Go to last branch in stack'
     's:Rebase and push entire stack'
     'sync:Rebase and push entire stack'
@@ -122,12 +124,12 @@ _git-xtax() {
             ':branch:__git_xtax_branch_names' \
             '--root=[Base branch]:branch:__git_xtax_branch_names'
           ;;
-        append|a)
+        stack)
           _arguments -s \
             ':branch:__git_xtax_branch_names' \
             '--onto=[Parent branch]:branch:__git_xtax_branch_names'
           ;;
-        prepend)
+        tuck)
           _arguments ':branch:__git_xtax_branch_names'
           ;;
         slideout)
@@ -137,7 +139,7 @@ _git-xtax() {
           _arguments ':stack:__git_xtax_stack_names'
           ;;
         sync)
-          _arguments '--current[Sync from current branch down]' '--continue[Continue after conflict]'
+          _arguments '--current[Sync current branch only]' '--cascade[Sync current branch and above]' '--continue[Continue after conflict]'
           ;;
         view|v)
           _arguments '--all[Show all stacks]'
@@ -395,9 +397,9 @@ class XtaxClient:
     self._save_state(name, state)
     print(f"Created stack {bold(name)} (root: {bold(root)}, branch: {bold(first_branch)})")
 
-  def cmd_append(self, args: List[str], stack_name: Optional[str] = None) -> None:
+  def cmd_stack(self, args: List[str], stack_name: Optional[str] = None) -> None:
     if not args:
-      raise XtaxException("Usage: git xtax append <branch> [--onto=<parent>]")
+      raise XtaxException("Usage: git xtax stack <branch> [--onto=<parent>]")
 
     branch_name = args[0]
     onto: Optional[str] = None
@@ -465,11 +467,11 @@ class XtaxClient:
       state.managed_branches.append(branch)
 
     self._save_state(name, state)
-    print(f"Appended {bold(branch)} onto {bold(parent)} in stack {bold(name)}")
+    print(f"Stacked {bold(branch)} onto {bold(parent)} in stack {bold(name)}")
 
-  def cmd_prepend(self, args: List[str]) -> None:
+  def cmd_tuck(self, args: List[str]) -> None:
     if not args:
-      raise XtaxException("Usage: git xtax prepend <branch>")
+      raise XtaxException("Usage: git xtax tuck <branch>")
 
     branch_name = args[0]
     branch = LocalBranchShortName.of(branch_name)
@@ -520,7 +522,7 @@ class XtaxClient:
     state.managed_branches.insert(managed_idx, branch)
 
     self._save_state(name, state)
-    print(f"Prepended {bold(branch)} before {bold(current)} in stack {bold(name)}")
+    print(f"Tucked {bold(branch)} under {bold(current)} in stack {bold(name)}")
 
   def cmd_slideout(self, args: List[str], stack_name: Optional[str] = None) -> None:
     if not args:
@@ -607,10 +609,11 @@ class XtaxClient:
     is_checked_out = branch == (checked_out if checked_out is not None else highlighted)
 
     if is_highlighted:
-      node = "◉"
       if is_checked_out:
+        node = colored("◉", active_color)
         branch_str = f"{node} " + colored(bold(str(branch)), active_color)
       else:
+        node = "◉"
         branch_str = f"{node} " + bold(str(branch))
     elif is_checked_out:
       branch_str = f"{dim('○')} " + colored(str(branch), active_color)
@@ -662,7 +665,6 @@ class XtaxClient:
                          ) -> List[Tuple[str, Optional[LocalBranchShortName]]]:
     """Build the view output as a list of (line, branch_or_None) pairs."""
     lines: List[Tuple[str, Optional[LocalBranchShortName]]] = []
-    lines.append((f"  Stack: {bold(name)}{self._xtax_ahead_behind_str()}", None))
 
     # Root branch — show ahead/behind vs remote tracking branch
     root_info = ""
@@ -698,9 +700,6 @@ class XtaxClient:
       return ''.join(parts)
 
     def collect_node(branch: LocalBranchShortName, depth: int) -> None:
-      if depth > 0:
-        lines.append((f"  {spine_prefix(depth).rstrip()}", None))
-
       info = self._branch_info_str(branch, state, highlighted, checked_out)
       lines.append((f"  {spine_prefix(depth)}{info}", branch))
 
@@ -715,6 +714,13 @@ class XtaxClient:
     for child in root_children:
       collect_node(child, 1)
     active_spines.discard(0)
+
+    # Reverse so root is at bottom and leaves at top (standard stack metaphor)
+    lines.reverse()
+
+    # Stack name header at the top
+    lines.insert(0, (f"  Stack: {bold(name)}{self._xtax_ahead_behind_str()}", None))
+    lines.insert(1, ("", None))
 
     return lines
 
@@ -741,10 +747,10 @@ class XtaxClient:
       return 'down'
     elif ch == 'q':
       return 'ctrl-c'
-    elif ch == 'a':
-      return 'append'
-    elif ch == 'p':
-      return 'prepend'
+    elif ch == 's':
+      return 'stack'
+    elif ch == 't':
+      return 'tuck'
     elif ch == 'd':
       return 'delete'
     elif ch == 'r':
@@ -776,10 +782,10 @@ class XtaxClient:
         return 'down'
       elif ch == b'q':
         return 'ctrl-c'
-      elif ch == b'a':
-        return 'append'
-      elif ch == b'p':
-        return 'prepend'
+      elif ch == b's':
+        return 'stack'
+      elif ch == b't':
+        return 'tuck'
       elif ch == b'd':
         return 'delete'
       elif ch == b'r':
@@ -829,7 +835,7 @@ class XtaxClient:
           print(line)
         return
       # Empty stack — show view with hint, allow append
-      hint = dim("  a: append first branch")
+      hint = dim("  s: stack first branch")
       lines = self._build_view_lines(name, state, current)
       num_lines = len(lines) + 1
       sys.stdout.write('\x1b[?25l')
@@ -838,13 +844,13 @@ class XtaxClient:
       try:
         while True:
           key = self._read_key()
-          if key == 'append':
+          if key == 'stack':
             self._exit_interactive(num_lines)
             root = state.root
             branch_name = input(rl_safe(f"Enter branch name to add to {bold(name)}: ")).strip()
             if branch_name:
               try:
-                self.cmd_append([branch_name, f'--onto={root}'], stack_name=name)
+                self.cmd_stack([branch_name, f'--onto={root}'], stack_name=name)
               except XtaxException as e:
                 print(colored(f"Error: {e}", AnsiEscapeCodes.RED))
             # Re-enter cmd_view to show updated state
@@ -884,14 +890,14 @@ class XtaxClient:
         return
       cursor = min(cursor, len(managed) - 1)
 
-      hint = dim("  a: append  p: prepend  r: rename  d: remove")
+      hint = dim("  s: stack  t: tuck  r: rename  d: slide out")
 
       def render_lines(cursor_idx: int) -> List[str]:
         highlighted = managed[cursor_idx]
         lines = self._build_view_lines(name, state, highlighted, checked_out=current)
-        return [line for line, _ in lines] + [hint]
+        return [line for line, _ in lines] + ["", hint]
 
-      num_lines = len(self._build_view_lines(name, state, current)) + 1
+      num_lines = len(self._build_view_lines(name, state, current)) + 2
       sys.stdout.write('\x1b[?25l')
 
       def draw(cursor_idx: int) -> None:
@@ -912,10 +918,10 @@ class XtaxClient:
       try:
         while True:
           key = self._read_key()
-          if key == 'up' and cursor > 0:
-            cursor -= 1
-          elif key == 'down' and cursor < len(managed) - 1:
+          if key == 'up' and cursor < len(managed) - 1:
             cursor += 1
+          elif key == 'down' and cursor > 0:
+            cursor -= 1
           elif key == 'enter':
             selected = managed[cursor]
             if not self._branch_exists_anywhere(selected):
@@ -934,7 +940,7 @@ class XtaxClient:
             for line, _ in self._build_view_lines(name, state, current):
               print(line)
             return
-          elif key in ('append', 'prepend', 'delete', 'rename'):
+          elif key in ('stack', 'tuck', 'delete', 'rename'):
             action = key
             self._exit_interactive(num_lines)
             break
@@ -950,21 +956,21 @@ class XtaxClient:
 
       # Handle actions outside interactive mode
       selected_branch = managed[cursor]
-      if action == 'append':
-        branch_name = input(rl_safe(f"Enter branch name to add after {bold(selected_branch)}: ")).strip()
+      if action == 'stack':
+        branch_name = input(rl_safe(f"Enter branch name to stack above {bold(selected_branch)}: ")).strip()
         if branch_name:
           try:
-            self.cmd_append([branch_name, f'--onto={selected_branch}'])
+            self.cmd_stack([branch_name, f'--onto={selected_branch}'])
           except XtaxException as e:
             print(colored(f"Error: {e}", AnsiEscapeCodes.RED))
-      elif action == 'prepend':
-        branch_name = input(rl_safe(f"Enter branch name to add before {bold(selected_branch)}: ")).strip()
+      elif action == 'tuck':
+        branch_name = input(rl_safe(f"Enter branch name to tuck under {bold(selected_branch)}: ")).strip()
         if branch_name:
           try:
-            # Checkout selected branch so prepend works relative to it
+            # Checkout selected branch so tuck works relative to it
             if current != selected_branch:
               self._git.checkout(selected_branch)
-            self.cmd_prepend([branch_name])
+            self.cmd_tuck([branch_name])
           except XtaxException as e:
             print(colored(f"Error: {e}", AnsiEscapeCodes.RED))
           finally:
@@ -993,10 +999,10 @@ class XtaxClient:
     current = self._current_branch()
     if current not in state.managed_branches:
       raise XtaxException(f"Branch {bold(current)} is not in the stack")
-    parent = state.up_branch_for.get(current)
-    if not parent or parent == state.root:
+    children = state.down_branches_for.get(current, [])
+    if not children:
       raise XtaxException(f"Branch {bold(current)} is at the top of the stack")
-    self._git.checkout(parent)
+    self._git.checkout(children[0])
     self._print_view()
 
   def cmd_down(self, args: List[str]) -> None:
@@ -1004,10 +1010,10 @@ class XtaxClient:
     current = self._current_branch()
     if current not in state.managed_branches:
       raise XtaxException(f"Branch {bold(current)} is not in the stack")
-    children = state.down_branches_for.get(current, [])
-    if not children:
-      raise XtaxException(f"Branch {bold(current)} has no children")
-    self._git.checkout(children[0])
+    parent = state.up_branch_for.get(current)
+    if not parent or parent == state.root:
+      raise XtaxException(f"Branch {bold(current)} is at the bottom of the stack")
+    self._git.checkout(parent)
     self._print_view()
 
   def cmd_top(self, args: List[str]) -> None:
@@ -1015,16 +1021,7 @@ class XtaxClient:
     root_children = state.down_branches_for.get(state.root, [])
     if not root_children:
       raise XtaxException("Stack has no branches")
-    target = root_children[0]
-    self._git.checkout(target)
-    self._print_view()
-
-  def cmd_bottom(self, args: List[str]) -> None:
-    name, state = self._resolve_current_stack()
-    root_children = state.down_branches_for.get(state.root, [])
-    if not root_children:
-      raise XtaxException("Stack has no branches")
-    # Follow first children to the deepest leaf
+    # Follow first children to the deepest leaf (top of stack)
     target = root_children[0]
     while True:
       children = state.down_branches_for.get(target, [])
@@ -1034,41 +1031,58 @@ class XtaxClient:
     self._git.checkout(target)
     self._print_view()
 
+  def cmd_bottom(self, args: List[str]) -> None:
+    name, state = self._resolve_current_stack()
+    root_children = state.down_branches_for.get(state.root, [])
+    if not root_children:
+      raise XtaxException("Stack has no branches")
+    # First child of root (bottom of stack)
+    target = root_children[0]
+    self._git.checkout(target)
+    self._print_view()
+
   def cmd_go_n(self, n: int) -> None:
-    """Navigate by integer. Positive = up N, negative = down N, 0 = first branch."""
+    """Navigate by integer. Positive = up N (toward leaf), negative = down N (toward root), 0 = leaf."""
     name, state = self._resolve_current_stack()
     current = self._current_branch()
     if current not in state.managed_branches:
       raise XtaxException(f"Branch {bold(current)} is not in the stack")
 
     if n == 0:
-      # Go to first branch in stack (first child of root)
+      # Go to leaf branch in stack (deepest child)
       root_children = state.down_branches_for.get(state.root, [])
       if not root_children:
         raise XtaxException("Stack has no branches")
       target = root_children[0]
+      while True:
+        children = state.down_branches_for.get(target, [])
+        if not children:
+          break
+        target = children[0]
       self._git.checkout(target)
       self._print_view()
       return
 
     if n > 0:
+      # Positive = up toward leaf (children)
       target = current
       for _ in range(n):
-        parent = state.up_branch_for.get(target)
-        if not parent or parent == state.root:
-          raise XtaxException(
-            f"Cannot go {n} up from {bold(current)} - "
-            f"reached top of stack at {bold(target)}")
-        target = parent
-    else:
-      target = current
-      for _ in range(-n):
         children = state.down_branches_for.get(target, [])
         if not children:
           raise XtaxException(
-            f"Cannot go {-n} down from {bold(current)} - "
-            f"reached leaf at {bold(target)}")
+            f"Cannot go {n} up from {bold(current)} - "
+            f"reached top of stack at {bold(target)}")
         target = children[0]
+    else:
+      # Negative = down toward root (parent)
+      target = current
+      for _ in range(-n):
+        parent = state.up_branch_for.get(target)
+        if not parent or parent == state.root:
+          raise XtaxException(
+            f"Cannot go {-n} down from {bold(current)} - "
+            f"reached bottom of stack at {bold(target)}")
+        target = parent
 
     self._git.checkout(target)
     self._print_view()
@@ -1077,6 +1091,7 @@ class XtaxClient:
     self._fetch_stacks()
     is_continue = '--continue' in args
     is_current_only = '--current' in args
+    is_cascade = '--cascade' in args
 
     if is_continue:
       self._sync_continue()
@@ -1127,6 +1142,10 @@ class XtaxClient:
           AnsiEscapeCodes.YELLOW))
 
     if is_current_only:
+      if current not in state.managed_branches:
+        raise XtaxException(f"Branch {bold(current)} is not in the stack")
+      branches_to_sync = [current]
+    elif is_cascade:
       if current not in state.managed_branches:
         raise XtaxException(f"Branch {bold(current)} is not in the stack")
       branches_to_sync = self._get_dfs_order(state, current)
@@ -1429,16 +1448,16 @@ class XtaxClient:
 
     print(f"  {dim('_xtax')}{self._xtax_ahead_behind_str()}")
 
-    active_color = AnsiEscapeCodes.GREEN
     for root, stack_names in roots.items():
+      print()
       print(f"  {dim(root)}")
       for s in stack_names:
         if s == current_stack:
-          node = colored("◉", active_color)
-          name_str = colored(bold(s), active_color)
+          node = colored("◉", AnsiEscapeCodes.GREEN)
+          name_str = colored(s, AnsiEscapeCodes.GREEN)
         else:
           node = dim("○")
-          name_str = s
+          name_str = dim(s)
         print(f"  {dim('│')} {node} {name_str}")
 
   def _interactive_stack_select(self, stacks: List[str],
@@ -1459,6 +1478,7 @@ class XtaxClient:
     entries: List[Tuple[Optional[str], Optional[str]]] = []
     entries.append(('__xtax_header__', None))
     for root, stack_names in roots.items():
+      entries.append(('__separator__', None))
       entries.append((root, None))
       for s in stack_names:
         entries.append((None, s))
@@ -1474,7 +1494,6 @@ class XtaxClient:
           cursor = idx
           break
 
-    active_color = AnsiEscapeCodes.GREEN
     xtax_info = self._xtax_ahead_behind_str()
 
     def render(cursor_idx: int) -> str:
@@ -1483,21 +1502,27 @@ class XtaxClient:
       for root_name, stack_name in entries:
         if root_name == '__xtax_header__':
           out.append(f"  {dim('_xtax')}{xtax_info}")
+        elif root_name == '__separator__':
+          out.append("")
         elif root_name is not None:
           out.append(f"  {dim(root_name)}")
         else:
           is_active = stack_name == current_stack
           if stack_name == highlighted:
-            node = "◉"
-            name_str = colored(bold(stack_name), active_color) if is_active else bold(stack_name)
+            node = colored("◉", AnsiEscapeCodes.GREEN) if is_active else "◉"
+            name_str = colored(bold(stack_name), AnsiEscapeCodes.GREEN) if is_active else bold(stack_name)
+          elif is_active:
+            node = colored("○", AnsiEscapeCodes.GREEN)
+            name_str = colored(stack_name, AnsiEscapeCodes.GREEN)
           else:
             node = dim("○")
-            name_str = colored(stack_name, active_color) if is_active else stack_name
+            name_str = dim(stack_name)
           out.append(f"  {dim('│')} {node} {name_str}")
+      out.append("")
       out.append(dim("  r: rename  d: delete"))
       return '\n'.join(out)
 
-    num_lines = len(entries) + 1
+    num_lines = len(entries) + 2
     sys.stdout.write('\x1b[?25l')
 
     def draw(cursor_idx: int) -> None:
@@ -1677,9 +1702,8 @@ class XtaxClient:
 
 COMMANDS = {
   'init': 'cmd_init',
-  'append': 'cmd_append',
-  'a': 'cmd_append',
-  'prepend': 'cmd_prepend',
+  'stack': 'cmd_stack',
+  'tuck': 'cmd_tuck',
   'slideout': 'cmd_slideout',
   'delete': 'cmd_delete',
   'rename': 'cmd_rename',
