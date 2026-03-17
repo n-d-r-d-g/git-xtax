@@ -858,7 +858,7 @@ class XtaxClient:
           print(line)
         return
       # Empty stack — show view with hint, allow append
-      hint = dim("  s: stack first branch")
+      hint = f"  s{dim(': stack first branch')}"
       lines = self._build_view_lines(name, state, current)
       num_lines = len(lines) + 1
       sys.stdout.write('\x1b[?25l')
@@ -913,7 +913,7 @@ class XtaxClient:
         return
       cursor = min(cursor, len(managed) - 1)
 
-      hint = dim("  s: stack  t: tuck  r: rename  d: slide out")
+      hint = f"  s{dim(': stack')}  t{dim(': tuck')}  r{dim(': rename')}  d{dim(': slide out')}"
 
       def render_lines(cursor_idx: int) -> List[str]:
         highlighted = managed[cursor_idx]
@@ -1542,7 +1542,7 @@ class XtaxClient:
             name_str = dim(stack_name)
           out.append(f"  {dim('│')} {node} {name_str}")
       out.append("")
-      out.append(dim("  r: rename  d: delete"))
+      out.append(f"  r{dim(': rename')}  d{dim(': delete')}")
       return '\n'.join(out)
 
     num_lines = len(entries) + 2
