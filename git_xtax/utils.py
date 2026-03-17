@@ -421,6 +421,13 @@ def colored(s: str, color: str) -> str:  # noqa: KW
     return s if ascii_only or not s else color + s + AnsiEscapeCodes.ENDC
 
 
+def hyperlink(text: str, url: str) -> str:
+    """Wrap text in an OSC 8 terminal hyperlink."""
+    if ascii_only:
+        return text
+    return f"\033]8;;{url}\033\\{text}\033]8;;\033\\"
+
+
 def rl_safe(s: str) -> str:
     """Wrap ANSI escape sequences with readline markers so input() calculates line width correctly."""
     import re

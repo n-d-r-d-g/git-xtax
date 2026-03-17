@@ -26,7 +26,7 @@ from git_xtax.git_operations import (
 )
 from git_xtax.stack_state import StackStorage, XtaxState
 from git_xtax.utils import (
-    AnsiEscapeCodes, bold, colored, debug, dim, fmt, rl_safe, underline, warn,
+    AnsiEscapeCodes, bold, colored, debug, dim, fmt, hyperlink, rl_safe, underline, warn,
 )
 
 _KNOWN_SPECS: List[CodeHostingSpec] = [GITLAB_CLIENT_SPEC, GITHUB_CLIENT_SPEC]
@@ -176,6 +176,8 @@ class XtaxClient:
   def __init__(self, git: GitContext, storage: StackStorage) -> None:
     self._git = git
     self._storage = storage
+    self._hosting_info: Optional[Tuple[CodeHostingClient, CodeHostingSpec]] = None
+    self._hosting_info_resolved: bool = False
 
   def _fetch_stacks(self) -> None:
     """Fetch and fast-forward _xtax from origin."""
@@ -250,15 +252,31 @@ class XtaxClient:
           return (client, spec)
     return None
 
-  def _extract_pr_number(self, annotation: Optional[Annotation], spec: CodeHostingSpec) -> Optional[int]:
-    """Extract PR/MR number from annotation text like 'MR !123' or 'PR #456'."""
+  def _extract_pr_identifier(self, annotation: Optional[Annotation], spec: CodeHostingSpec) -> Optional[str]:
+    """Extract PR/MR identifier from annotation text like 'MR !123' or 'PR #456'."""
     if not annotation or not annotation.text_without_qualifiers:
       return None
     text = annotation.text_without_qualifiers
     import re
-    pattern = re.escape(spec.pr_short_name) + r'\s*' + re.escape(spec.pr_ordinal_char) + r'(\d+)'
+    pattern = re.escape(spec.pr_short_name) + r'\s*' + re.escape(spec.pr_ordinal_char) + r'(\S+)'
     match = re.match(pattern, text)
-    return int(match.group(1)) if match else None
+    return match.group(1) if match else None
+
+  def _get_pr_url(self, annotation: Optional[Annotation]) -> Optional[str]:
+    """Build a web URL for the PR/MR in the annotation, if any."""
+    if not self._hosting_info_resolved:
+      self._hosting_info_resolved = True
+      try:
+        self._hosting_info = self._get_code_hosting_client()
+      except Exception:
+        pass
+    if not self._hosting_info or not annotation:
+      return None
+    client, spec = self._hosting_info
+    identifier = self._extract_pr_identifier(annotation, spec)
+    if identifier is None:
+      return None
+    return client.get_pr_url(identifier)
 
   def _ensure_pr(self, client: CodeHostingClient, spec: CodeHostingSpec,
                  branch: LocalBranchShortName, parent: LocalBranchShortName,
@@ -266,17 +284,17 @@ class XtaxClient:
     """Create or retarget a PR/MR for branch."""
     pr_label = f"{spec.pr_short_name} {spec.pr_ordinal_char}"
     annotation = state.annotations.get(branch)
-    existing_pr_number = self._extract_pr_number(annotation, spec)
+    existing_pr_id = self._extract_pr_identifier(annotation, spec)
 
-    # If we already have a PR number, check if it's still open and needs retargeting
-    if existing_pr_number is not None:
-      pr = client.get_pull_request_by_number_or_none(existing_pr_number)
+    # If we already have a PR identifier, check if it's still open and needs retargeting
+    if existing_pr_id is not None:
+      pr = client.get_pull_request_by_identifier_or_none(existing_pr_id)
       if pr and pr.state in ('opened', 'open'):
         if pr.base != str(parent):
-          client.set_base_of_pull_request(existing_pr_number, parent)
-          print(f"  Retargeted {pr_label}{existing_pr_number} for {bold(branch)} → {bold(parent)}")
+          client.set_base_of_pull_request(existing_pr_id, parent)
+          print(f"  Retargeted {pr_label}{existing_pr_id} for {bold(branch)} → {bold(parent)}")
         else:
-          debug(f"Branch {branch} already has {pr_label}{existing_pr_number} targeting {parent}")
+          debug(f"Branch {branch} already has {pr_label}{existing_pr_id} targeting {parent}")
         return
       # PR is closed/merged — fall through to find or create a new one
 
@@ -288,7 +306,7 @@ class XtaxClient:
     )
     if matching_pr:
       pr = matching_pr
-      print(f"  Found existing {pr_label}{pr.number} for {bold(branch)} → {bold(parent)}")
+      print(f"  Found existing {pr_label}{pr.identifier} for {bold(branch)} → {bold(parent)}")
     else:
       # Create new PR
       org_repo = client.get_org_and_repo()
@@ -300,10 +318,10 @@ class XtaxClient:
         description='',
         draft=True,
       )
-      print(f"  Created {pr_label}{pr.number} for {bold(branch)} → {bold(parent)}")
+      print(f"  Created {pr_label}{pr.identifier} for {bold(branch)} → {bold(parent)}")
 
     # Save PR annotation
-    pr_text = f"{spec.pr_short_name} {spec.pr_ordinal_char}{pr.number}"
+    pr_text = f"{spec.pr_short_name} {spec.pr_ordinal_char}{pr.identifier}"
     qualifiers_text = ''
     if annotation and annotation.qualifiers.is_non_default():
       qualifiers_text = str(annotation.qualifiers)
@@ -623,7 +641,12 @@ class XtaxClient:
     # Annotation
     anno = ""
     if branch in state.annotations and state.annotations[branch].formatted_full_text:
-      anno = "  " + state.annotations[branch].formatted_full_text
+      annotation = state.annotations[branch]
+      anno_text = annotation.formatted_full_text
+      pr_url = self._get_pr_url(annotation)
+      if pr_url:
+        anno_text = hyperlink(anno_text, pr_url)
+      anno = "  " + anno_text
 
     # Ahead/behind parent, colored by sync status
     parent_info = ""

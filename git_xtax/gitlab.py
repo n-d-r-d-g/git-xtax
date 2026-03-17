@@ -105,13 +105,16 @@ class GitLabClient(CodeHostingClient):
         super().__init__(domain, organization, repository)
         self.__token: Optional[GitLabToken] = GitLabToken.for_domain(domain)
 
+    def get_pr_url(self, identifier: str) -> str:
+        return f"https://{self.domain}/{self.organization}/{self.repository}/-/merge_requests/{identifier}"
+
     def has_token(self) -> bool:
         return self.__token is not None
 
     @staticmethod
     def __get_merge_request_from_json(mr_json: Dict[str, Any]) -> PullRequest:
         return PullRequest(
-            number=int(mr_json['iid']),
+            identifier=str(mr_json['iid']),
             display_prefix='MR !',
             user=mr_json['author']['username'],
             base=mr_json['target_branch'],
@@ -252,38 +255,38 @@ class GitLabClient(CodeHostingClient):
         else:
             return None
 
-    def add_assignees_to_pull_request(self, number: int, assignees: List[str]) -> None:
+    def add_assignees_to_pull_request(self, identifier: str, assignees: List[str]) -> None:
         assignee_ids: List[int] = map_truthy_only(self.__get_user_id_by_username, assignees)
         request_body: Dict[str, List[int]] = {'assignee_ids': assignee_ids}
-        self.__fire_gitlab_api_project_request(method='PUT', path_suffix=f'/merge_requests/{number}', request_body=request_body)
+        self.__fire_gitlab_api_project_request(method='PUT', path_suffix=f'/merge_requests/{identifier}', request_body=request_body)
 
-    def add_reviewers_to_pull_request(self, number: int, reviewers: List[str]) -> None:
+    def add_reviewers_to_pull_request(self, identifier: str, reviewers: List[str]) -> None:
         reviewer_ids: List[int] = map_truthy_only(self.__get_user_id_by_username, reviewers)
         request_body: Dict[str, List[int]] = {'reviewer_ids': reviewer_ids}
-        self.__fire_gitlab_api_project_request(method='PUT', path_suffix=f'/merge_requests/{number}', request_body=request_body)
+        self.__fire_gitlab_api_project_request(method='PUT', path_suffix=f'/merge_requests/{identifier}', request_body=request_body)
 
-    def set_base_of_pull_request(self, number: int, base: LocalBranchShortName) -> None:
+    def set_base_of_pull_request(self, identifier: str, base: LocalBranchShortName) -> None:
         request_body: Dict[str, str] = {'target_branch': base}
-        self.__fire_gitlab_api_project_request(method='PUT', path_suffix=f'/merge_requests/{number}', request_body=request_body)
+        self.__fire_gitlab_api_project_request(method='PUT', path_suffix=f'/merge_requests/{identifier}', request_body=request_body)
 
-    def set_description_of_pull_request(self, number: int, description: str) -> None:
+    def set_description_of_pull_request(self, identifier: str, description: str) -> None:
         request_body: Dict[str, str] = {'description': description}
-        self.__fire_gitlab_api_project_request(method='PUT', path_suffix=f'/merge_requests/{number}', request_body=request_body)
+        self.__fire_gitlab_api_project_request(method='PUT', path_suffix=f'/merge_requests/{identifier}', request_body=request_body)
 
-    def set_milestone_of_pull_request(self, number: int, milestone: str) -> None:
+    def set_milestone_of_pull_request(self, identifier: str, milestone: str) -> None:
         request_body: Dict[str, str] = {'milestone_id': milestone}
-        self.__fire_gitlab_api_project_request(method='PUT', path_suffix=f'/merge_requests/{number}', request_body=request_body)
+        self.__fire_gitlab_api_project_request(method='PUT', path_suffix=f'/merge_requests/{identifier}', request_body=request_body)
 
-    def set_draft_status_of_pull_request(self, number: int, *, target_draft_status: bool) -> bool:
-        mr = self.__fire_gitlab_api_project_request(method='GET', path_suffix=f'/merge_requests/{number}')
+    def set_draft_status_of_pull_request(self, identifier: str, *, target_draft_status: bool) -> bool:
+        mr = self.__fire_gitlab_api_project_request(method='GET', path_suffix=f'/merge_requests/{identifier}')
         is_draft = bool(mr["draft"])  # bool(...) to satisfy mypy
         if is_draft and target_draft_status is True:
-            debug(f"MR !{number} is already a draft")
+            debug(f"MR !{identifier} is already a draft")
             return False
         if not is_draft and target_draft_status is False:
             # This case is not covered by tests since there's currently no scenario
             # in `git xtax gitlab restack-mr` that could reach here.
-            debug(f"MR !{number} is already ready for review")
+            debug(f"MR !{identifier} is already ready for review")
             return False
 
         old_title = mr["title"]
@@ -293,7 +296,7 @@ class GitLabClient(CodeHostingClient):
             # Prefixes as per https://docs.gitlab.com/ee/user/project/merge_requests/drafts.html in March 2024
             new_title = re.sub(r'^(\[Draft]|Draft:|\(Draft\)) *', '', old_title)
         request_body: Dict[str, str] = {'title': new_title}
-        self.__fire_gitlab_api_project_request(method='PUT', path_suffix=f'/merge_requests/{number}', request_body=request_body)
+        self.__fire_gitlab_api_project_request(method='PUT', path_suffix=f'/merge_requests/{identifier}', request_body=request_body)
         return True
 
     def get_open_pull_requests_by_head(self, head: LocalBranchShortName) -> List[PullRequest]:
@@ -311,9 +314,9 @@ class GitLabClient(CodeHostingClient):
         user = self.__fire_gitlab_api_request(method='GET', path='/user')
         return str(user['username'])  # str() to satisfy mypy
 
-    def get_pull_request_by_number_or_none(self, number: int) -> Optional[PullRequest]:
+    def get_pull_request_by_identifier_or_none(self, identifier: str) -> Optional[PullRequest]:
         try:
-            mr_json = self.__fire_gitlab_api_project_request(method='GET', path_suffix=f'/merge_requests/{number}')
+            mr_json = self.__fire_gitlab_api_project_request(method='GET', path_suffix=f'/merge_requests/{identifier}')
             return self.__get_merge_request_from_json(mr_json)
         except XtaxException:
             return None

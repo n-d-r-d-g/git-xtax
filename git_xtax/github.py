@@ -155,12 +155,15 @@ class GitHubClient(CodeHostingClient):
         super().__init__(domain, organization, repository)
         self.__token: Optional[GitHubToken] = GitHubToken.for_domain(domain)
 
+    def get_pr_url(self, identifier: str) -> str:
+        return f"https://{self.domain}/{self.organization}/{self.repository}/pull/{identifier}"
+
     def has_token(self) -> bool:
         return self.__token is not None
 
     def __get_pull_request_from_json(self, pr_json: Dict[str, Any]) -> "PullRequest":
         return PullRequest(
-            number=int(pr_json['number']),
+            identifier=str(pr_json['number']),
             display_prefix='PR #',
             user=pr_json['user']['login'],
             base=pr_json['base']['ref'],
@@ -318,45 +321,45 @@ class GitHubClient(CodeHostingClient):
         pr = self.__fire_github_api_repo_request(method='POST', path_suffix='/pulls', request_body=request_body)
         return self.__get_pull_request_from_json(pr)
 
-    def add_assignees_to_pull_request(self, number: int, assignees: List[str]) -> None:
+    def add_assignees_to_pull_request(self, identifier: str, assignees: List[str]) -> None:
         request_body: Dict[str, List[str]] = {
             'assignees': assignees
         }
         # Adding assignees is only available via the Issues API, not PRs API.
-        self.__fire_github_api_repo_request(method='POST', path_suffix=f'/issues/{number}/assignees', request_body=request_body)
+        self.__fire_github_api_repo_request(method='POST', path_suffix=f'/issues/{identifier}/assignees', request_body=request_body)
 
-    def add_reviewers_to_pull_request(self, number: int, reviewers: List[str]) -> None:
+    def add_reviewers_to_pull_request(self, identifier: str, reviewers: List[str]) -> None:
         request_body: Dict[str, List[str]] = {
             'reviewers': reviewers
         }
-        self.__fire_github_api_repo_request(method='POST', path_suffix=f'/pulls/{number}/requested_reviewers', request_body=request_body)
+        self.__fire_github_api_repo_request(method='POST', path_suffix=f'/pulls/{identifier}/requested_reviewers', request_body=request_body)
 
-    def set_base_of_pull_request(self, number: int, base: LocalBranchShortName) -> None:
+    def set_base_of_pull_request(self, identifier: str, base: LocalBranchShortName) -> None:
         request_body: Dict[str, str] = {'base': base}
-        self.__fire_github_api_repo_request(method='PATCH', path_suffix=f'/pulls/{number}', request_body=request_body)
+        self.__fire_github_api_repo_request(method='PATCH', path_suffix=f'/pulls/{identifier}', request_body=request_body)
 
-    def set_description_of_pull_request(self, number: int, description: str) -> None:
+    def set_description_of_pull_request(self, identifier: str, description: str) -> None:
         request_body: Dict[str, str] = {'body': description}
-        self.__fire_github_api_repo_request(method='PATCH', path_suffix=f'/pulls/{number}', request_body=request_body)
+        self.__fire_github_api_repo_request(method='PATCH', path_suffix=f'/pulls/{identifier}', request_body=request_body)
 
-    def set_milestone_of_pull_request(self, number: int, milestone: str) -> None:
+    def set_milestone_of_pull_request(self, identifier: str, milestone: str) -> None:
         request_body: Dict[str, str] = {'milestone': milestone}
         # Setting milestone is only available via the Issues API, not PRs API.
-        self.__fire_github_api_repo_request(method='PATCH', path_suffix=f'/issues/{number}', request_body=request_body)
+        self.__fire_github_api_repo_request(method='PATCH', path_suffix=f'/issues/{identifier}', request_body=request_body)
 
     # As of September 2023, REST (v3) GitHub API does **not** allow for setting PR draft status,
     # only for creating a draft PR or retrieving draft status on an existing PR.
     # See https://docs.github.com/en/rest/pulls/pulls?apiVersion=2022-11-28#update-a-pull-request
     # and https://github.com/orgs/community/discussions/45174.
     # GraphQL (v4) API mutation needs to be used for that purpose.
-    def set_draft_status_of_pull_request(self, number: int, *, target_draft_status: bool) -> bool:
+    def set_draft_status_of_pull_request(self, identifier: str, *, target_draft_status: bool) -> bool:
         """Returns true if PR had a different draft status, and draft status has been toggled.
         Returns false if PR already had the desired draft status, and hence draft status has NOT been toggled."""
 
         # This query is required to get the GraphQL-specific id of the PR
         query = f"""query {{
             repository(owner: "{self.organization}", name: "{self.repository}") {{
-                pullRequest(number: {number}) {{
+                pullRequest(number: {identifier}) {{
                     id
                     isDraft
                 }}
@@ -366,12 +369,12 @@ class GitHubClient(CodeHostingClient):
         debug(f"query response is {response}")
         is_draft = response["data"]["repository"]["pullRequest"]["isDraft"]
         if is_draft and target_draft_status is True:
-            debug(f"PR #{number} is already a draft")
+            debug(f"PR #{identifier} is already a draft")
             return False
         if not is_draft and target_draft_status is False:
             # This case is not covered by tests since there's currently no scenario
             # in `git xtax github restack-pr` that could reach here.
-            debug(f"PR #{number} is already ready for review")
+            debug(f"PR #{identifier} is already ready for review")
             return False
 
         # Ids are of the form "PR_kwDOB1DpPc5bDwiF"
@@ -404,9 +407,9 @@ class GitHubClient(CodeHostingClient):
         user = self.__fire_github_api_request(method='GET', path='/user')
         return str(user['login'])  # str() to satisfy mypy
 
-    def get_pull_request_by_number_or_none(self, number: int) -> Optional[PullRequest]:
+    def get_pull_request_by_identifier_or_none(self, identifier: str) -> Optional[PullRequest]:
         try:
-            pr_json: Dict[str, Any] = self.__fire_github_api_repo_request(method='GET', path_suffix=f'/pulls/{number}')
+            pr_json: Dict[str, Any] = self.__fire_github_api_repo_request(method='GET', path_suffix=f'/pulls/{identifier}')
             return self.__get_pull_request_from_json(pr_json)
         except XtaxException:
             return None

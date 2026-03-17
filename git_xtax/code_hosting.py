@@ -8,9 +8,9 @@ from git_xtax.utils import bold
 
 
 class PullRequest:
-    def __init__(self, number: int, display_prefix: str, user: str, base: str, head: str, head_repo_id: int,
+    def __init__(self, identifier: str, display_prefix: str, user: str, base: str, head: str, head_repo_id: int,
                  state: str, title: str, description: Optional[str], html_url: str):
-        self.__number = number
+        self.__identifier = identifier
         self.__display_prefix = display_prefix
         self.__user = user
         self.__base = base
@@ -23,7 +23,7 @@ class PullRequest:
 
     def copy(self) -> "PullRequest":
         return PullRequest(
-            number=self.__number,
+            identifier=self.__identifier,
             display_prefix=self.__display_prefix,
             user=self.__user,
             base=self.__base,
@@ -36,8 +36,8 @@ class PullRequest:
         )
 
     @property
-    def number(self) -> int:
-        return self.__number
+    def identifier(self) -> str:
+        return self.__identifier
 
     @property
     def display_prefix(self) -> str:
@@ -87,8 +87,7 @@ class PullRequest:
         return self.display_text(fmt).split(" ")[1]
 
     def display_text(self, fmt: bool = True) -> str:
-        number = str(self.number)
-        return f"{self.display_prefix}{bold(number) if fmt else number}"
+        return f"{self.display_prefix}{bold(self.identifier) if fmt else self.identifier}"
 
     def __repr__(self) -> str:
         # repr is used in debug messages, let's turn off formatting
@@ -212,6 +211,10 @@ class CodeHostingClient(metaclass=ABCMeta):  # pragma: no cover
         return OrganizationAndRepository(self.organization, self.repository)
 
     @abstractmethod
+    def get_pr_url(self, identifier: str) -> str:
+        """Return the web URL for a PR/MR by identifier."""
+
+    @abstractmethod
     def has_token(self) -> bool:
         pass
 
@@ -221,27 +224,27 @@ class CodeHostingClient(metaclass=ABCMeta):  # pragma: no cover
         pass
 
     @abstractmethod
-    def add_assignees_to_pull_request(self, number: int, assignees: List[str]) -> None:
+    def add_assignees_to_pull_request(self, identifier: str, assignees: List[str]) -> None:
         pass
 
     @abstractmethod
-    def add_reviewers_to_pull_request(self, number: int, reviewers: List[str]) -> None:
+    def add_reviewers_to_pull_request(self, identifier: str, reviewers: List[str]) -> None:
         pass
 
     @abstractmethod
-    def set_base_of_pull_request(self, number: int, base: LocalBranchShortName) -> None:
+    def set_base_of_pull_request(self, identifier: str, base: LocalBranchShortName) -> None:
         pass
 
     @abstractmethod
-    def set_description_of_pull_request(self, number: int, description: str) -> None:
+    def set_description_of_pull_request(self, identifier: str, description: str) -> None:
         pass
 
     @abstractmethod
-    def set_milestone_of_pull_request(self, number: int, milestone: str) -> None:
+    def set_milestone_of_pull_request(self, identifier: str, milestone: str) -> None:
         pass
 
     @abstractmethod
-    def set_draft_status_of_pull_request(self, number: int, *, target_draft_status: bool) -> bool:
+    def set_draft_status_of_pull_request(self, identifier: str, *, target_draft_status: bool) -> bool:
         """Returns true if PR had a different draft status, and draft status has been toggled.
         Returns false if PR already had the desired draft status, and hence draft status has NOT been toggled."""
 
@@ -258,7 +261,7 @@ class CodeHostingClient(metaclass=ABCMeta):  # pragma: no cover
         pass
 
     @abstractmethod
-    def get_pull_request_by_number_or_none(self, number: int) -> Optional[PullRequest]:
+    def get_pull_request_by_identifier_or_none(self, identifier: str) -> Optional[PullRequest]:
         pass
 
     @abstractmethod
