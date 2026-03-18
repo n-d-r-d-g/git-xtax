@@ -7,6 +7,30 @@ xtax is a forge-agnostic* git extension for stacking built on top of [git-machet
 >
 > We use the adapter pattern to support multiple forges. However, we currently only have an adapter for GitLab. We plan to add support for more forges in the future.
 
+## Installation
+
+```bash
+git clone https://github.com/n-d-r-d-g/git-xtax.git
+cd git-xtax
+python -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+pip install -e .
+```
+
+Then add aliases for convenience. In your `~/.zshrc`:
+
+```zsh
+alias gx='git xtax'
+# or
+alias g='git xtax'
+```
+
+Or as a git alias (lets you type `git x <command>`):
+
+```bash
+git config --global alias.x xtax
+```
+
 ## Storing stacks in an orphan branch
 
 Stacks are stored in an orphan branch named _xtax. We use a .yml file for each stack.
