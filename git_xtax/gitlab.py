@@ -121,7 +121,7 @@ class GitLabClient(CodeHostingClient):
             head=mr_json['source_branch'],
             head_repo_id=int(mr_json['source_project_id']),
             html_url=mr_json['web_url'],
-            state=mr_json['state'],
+            state='open' if mr_json['state'] == 'opened' else mr_json['state'],
             title=mr_json['title'],
             description=mr_json['description'])
 

@@ -421,6 +421,10 @@ def colored(s: str, color: str) -> str:  # noqa: KW
     return s if ascii_only or not s else color + s + AnsiEscapeCodes.ENDC
 
 
+def strikethrough(s: str) -> str:
+    return s if ascii_only or not s else "\033[9m" + s + "\033[29m"
+
+
 def hyperlink(text: str, url: str) -> str:
     """Wrap text in an OSC 8 terminal hyperlink."""
     if ascii_only:

@@ -170,7 +170,7 @@ class GitHubClient(CodeHostingClient):
             head=pr_json['head']['ref'],
             head_repo_id=pr_json['head']['repo']['id'],
             html_url=pr_json['html_url'],
-            state=pr_json['state'],
+            state='merged' if pr_json.get('merged_at') else pr_json['state'],
             title=pr_json['title'],
             description=pr_json['body'])
 

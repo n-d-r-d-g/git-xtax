@@ -26,7 +26,7 @@ from git_xtax.git_operations import (
 )
 from git_xtax.stack_state import StackStorage, XtaxState
 from git_xtax.utils import (
-    AnsiEscapeCodes, bold, colored, debug, dim, fmt, hyperlink, rl_safe, underline, warn,
+    AnsiEscapeCodes, bold, colored, debug, dim, fmt, hyperlink, rl_safe, strikethrough, underline, warn,
 )
 
 _KNOWN_SPECS: List[CodeHostingSpec] = [GITLAB_CLIENT_SPEC, GITHUB_CLIENT_SPEC]
@@ -178,6 +178,7 @@ class XtaxClient:
     self._storage = storage
     self._hosting_info: Optional[Tuple[CodeHostingClient, CodeHostingSpec]] = None
     self._hosting_info_resolved: bool = False
+    self._pr_status_cache: Dict[str, Optional[str]] = {}
 
   def _fetch_stacks(self) -> None:
     """Fetch and fast-forward _xtax from origin."""
@@ -278,6 +279,28 @@ class XtaxClient:
       return None
     return client.get_pr_url(identifier)
 
+  def _get_pr_status(self, annotation: Optional[Annotation]) -> Optional[str]:
+    """Return normalized PR/MR status: 'open', 'merged', 'closed', or None."""
+    if not self._hosting_info_resolved:
+      self._hosting_info_resolved = True
+      try:
+        self._hosting_info = self._get_code_hosting_client()
+      except Exception:
+        pass
+    if not self._hosting_info or not annotation:
+      return None
+    client, spec = self._hosting_info
+    identifier = self._extract_pr_identifier(annotation, spec)
+    if identifier is None:
+      return None
+    if identifier not in self._pr_status_cache:
+      try:
+        pr = client.get_pull_request_by_identifier_or_none(identifier)
+        self._pr_status_cache[identifier] = pr.state if pr else None
+      except Exception:
+        self._pr_status_cache[identifier] = None
+    return self._pr_status_cache[identifier]
+
   def _ensure_pr(self, client: CodeHostingClient, spec: CodeHostingSpec,
                  branch: LocalBranchShortName, parent: LocalBranchShortName,
                  state: XtaxState, stack_name: str) -> None:
@@ -289,7 +312,7 @@ class XtaxClient:
     # If we already have a PR identifier, check if it's still open and needs retargeting
     if existing_pr_id is not None:
       pr = client.get_pull_request_by_identifier_or_none(existing_pr_id)
-      if pr and pr.state in ('opened', 'open'):
+      if pr and pr.state == 'open':
         if pr.base != str(parent):
           client.set_base_of_pull_request(existing_pr_id, parent)
           print(f"  Retargeted {pr_label}{existing_pr_id} for {bold(branch)} → {bold(parent)}")
@@ -642,7 +665,15 @@ class XtaxClient:
     anno = ""
     if branch in state.annotations and state.annotations[branch].formatted_full_text:
       annotation = state.annotations[branch]
-      anno_text = annotation.formatted_full_text
+      pr_status = self._get_pr_status(annotation)
+      if pr_status == 'open':
+        anno_text = annotation.unformatted_full_text
+      elif pr_status == 'merged':
+        anno_text = dim(annotation.unformatted_full_text)
+      elif pr_status == 'closed':
+        anno_text = dim(strikethrough(annotation.unformatted_full_text))
+      else:
+        anno_text = annotation.formatted_full_text
       pr_url = self._get_pr_url(annotation)
       if pr_url:
         anno_text = hyperlink(anno_text, pr_url)
