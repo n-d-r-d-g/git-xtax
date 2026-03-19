@@ -660,9 +660,13 @@ class XtaxClient:
           parts = ahead_behind.stdout.strip().split('\t')
           if len(parts) == 2:
             behind, ahead = parts
-            ahead_str = colored(f"{ahead}↑", AnsiEscapeCodes.GREEN) if ahead != "0" else dim(f"{ahead}↑")
-            behind_str = colored(f"{behind}↓", AnsiEscapeCodes.RED) if behind != "0" else dim(f"{behind}↓")
-            parent_info = f" {dim('(')}{behind_str} {ahead_str}{dim(')')}"
+            parts_str = []
+            if behind != "0":
+              parts_str.append(colored(f"{behind}↓", AnsiEscapeCodes.RED))
+            if ahead != "0":
+              parts_str.append(colored(f"{ahead}↑", AnsiEscapeCodes.GREEN))
+            if parts_str:
+              parent_info = f"  {dim('(')}{' '.join(parts_str)}{dim(')')}"
       except Exception as e:
         debug(f"Failed to get ahead/behind for {branch} vs {parent}: {e}")
 
@@ -700,9 +704,13 @@ class XtaxClient:
         parts = ahead_behind.stdout.strip().split('\t')
         if len(parts) == 2:
           behind, ahead = parts
-          ahead_str = colored(f"{ahead}↑", AnsiEscapeCodes.GREEN) if ahead != "0" else dim(f"{ahead}↑")
-          behind_str = colored(f"{behind}↓", AnsiEscapeCodes.RED) if behind != "0" else dim(f"{behind}↓")
-          root_info = f" {dim('(')}{behind_str} {ahead_str}{dim(')')}"
+          parts_str = []
+          if behind != "0":
+            parts_str.append(colored(f"{behind}↓", AnsiEscapeCodes.RED))
+          if ahead != "0":
+            parts_str.append(colored(f"{ahead}↑", AnsiEscapeCodes.GREEN))
+          if parts_str:
+            root_info = f"  {dim('(')}{' '.join(parts_str)}{dim(')')}"
     except Exception as e:
       debug(f"Failed to get ahead/behind for root {state.root}: {e}")
     lines.append((f"  {dim('○')} {dim(str(state.root))}{root_info}", None))
