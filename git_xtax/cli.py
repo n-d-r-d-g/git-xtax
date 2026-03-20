@@ -801,7 +801,7 @@ class XtaxClient:
             root_info = f"  {dim('→')}  {dim('(')}{' '.join(parts_str)}{dim(')')}"
     except Exception as e:
       debug(f"Failed to get ahead/behind for root {state.root}: {e}")
-    lines.append((f"  {dim('○')} {dim(str(state.root))}{root_info}", None))
+    lines.append((f"  {dim('▲')} {dim(str(state.root))}{root_info}", None))
 
     root_children = state.down_branches_for.get(state.root, [])
     if not root_children:
@@ -821,17 +821,15 @@ class XtaxClient:
     # Reverse so root is at bottom and leaves at top (standard stack metaphor)
     lines.reverse()
 
-    # Assign connectors: ┌ on first managed branch, ├ on the rest
-    first = True
+    # Add indentation for managed branches
     for i, (line, branch) in enumerate(lines):
       if branch is not None:
-        connector = dim('┌') if first else dim('├')
-        lines[i] = (f"  {connector} {line}", branch)
-        first = False
+        lines[i] = (f"  {line}", branch)
 
     # Stack name header at the top
-    lines.insert(0, (f"  Stack: {bold(name)}{self._xtax_ahead_behind_str()}", None))
-    lines.insert(1, ("", None))
+    lines.insert(0, ("", None))
+    lines.insert(1, (f"Stack: {bold(name)}{self._xtax_ahead_behind_str()}", None))
+    lines.insert(2, ("", None))
 
     return lines
 
@@ -1001,7 +999,7 @@ class XtaxClient:
         return
       cursor = min(cursor, len(managed) - 1)
 
-      hint = f"  s{dim(': stack')}  t{dim(': tuck')}  r{dim(': rename')}  d{dim(': slide out')}"
+      hint = f"s{dim(': stack')}  t{dim(': tuck')}  r{dim(': rename')}  d{dim(': slide out')}"
 
       def render_lines(cursor_idx: int) -> List[str]:
         highlighted = managed[cursor_idx]
