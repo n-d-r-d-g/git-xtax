@@ -179,6 +179,7 @@ class XtaxClient:
     self._hosting_info: Optional[Tuple[CodeHostingClient, CodeHostingSpec]] = None
     self._hosting_info_resolved: bool = False
     self._pr_status_cache: Dict[str, Optional[str]] = {}
+    self._pr_comment_count_cache: Dict[str, int] = {}
 
   def _fetch_stacks(self) -> None:
     """Fetch and fast-forward _xtax from origin."""
@@ -300,6 +301,57 @@ class XtaxClient:
       except Exception:
         self._pr_status_cache[identifier] = None
     return self._pr_status_cache[identifier]
+
+  def _get_pr_unresolved_count(self, annotation: Optional[Annotation]) -> Optional[int]:
+    """Return cached unresolved comment count for the PR/MR in the annotation."""
+    if not self._hosting_info or not annotation:
+      return None
+    _, spec = self._hosting_info
+    identifier = self._extract_pr_identifier(annotation, spec)
+    if identifier is None:
+      return None
+    return self._pr_comment_count_cache.get(identifier)
+
+  def _prefetch_pr_data(self, state: XtaxState) -> None:
+    """Prefetch PR status and unresolved comment count for all annotated branches in parallel."""
+    if not self._hosting_info_resolved:
+      self._hosting_info_resolved = True
+      try:
+        self._hosting_info = self._get_code_hosting_client()
+      except Exception:
+        pass
+    if not self._hosting_info:
+      return
+    client, spec = self._hosting_info
+
+    to_fetch = []
+    for annotation in state.annotations.values():
+      identifier = self._extract_pr_identifier(annotation, spec)
+      if identifier and (
+        identifier not in self._pr_status_cache or
+        identifier not in self._pr_comment_count_cache
+      ):
+        to_fetch.append(identifier)
+
+    if not to_fetch:
+      return
+
+    def fetch_one(identifier: str) -> None:
+      if identifier not in self._pr_status_cache:
+        try:
+          pr = client.get_pull_request_by_identifier_or_none(identifier)
+          self._pr_status_cache[identifier] = pr.state if pr else None
+        except Exception:
+          self._pr_status_cache[identifier] = None
+      if identifier not in self._pr_comment_count_cache:
+        try:
+          self._pr_comment_count_cache[identifier] = client.get_unresolved_comment_count(identifier)
+        except Exception:
+          self._pr_comment_count_cache[identifier] = 0
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(len(to_fetch), 8)) as executor:
+      list(executor.map(fetch_one, to_fetch))
 
   def _ensure_pr(self, client: CodeHostingClient, spec: CodeHostingSpec,
                  branch: LocalBranchShortName, parent: LocalBranchShortName,
@@ -677,7 +729,11 @@ class XtaxClient:
       pr_url = self._get_pr_url(annotation)
       if pr_url:
         anno_text = hyperlink(anno_text, pr_url)
-      anno = "  " + anno_text
+      unresolved = self._get_pr_unresolved_count(annotation)
+      if unresolved:
+        review_word = "review" if unresolved == 1 else "reviews"
+        anno_text += f" {dim('(')}{colored(f'{unresolved} {review_word}', AnsiEscapeCodes.YELLOW)}{dim(')')}"
+      anno = f"  {dim('→')}  " + anno_text
 
     # Ahead/behind parent, colored by sync status
     parent_info = ""
@@ -697,7 +753,7 @@ class XtaxClient:
             if ahead != "0":
               parts_str.append(colored(f"{ahead}↑", AnsiEscapeCodes.GREEN))
             if parts_str:
-              parent_info = f"  {dim('(')}{' '.join(parts_str)}{dim(')')}"
+              parent_info = f"  {dim('→')}  {dim('(')}{' '.join(parts_str)}{dim(')')}"
       except Exception as e:
         debug(f"Failed to get ahead/behind for {branch} vs {parent}: {e}")
 
@@ -722,6 +778,7 @@ class XtaxClient:
                          checked_out: Optional[LocalBranchShortName] = None
                          ) -> List[Tuple[str, Optional[LocalBranchShortName]]]:
     """Build the view output as a list of (line, branch_or_None) pairs."""
+    self._prefetch_pr_data(state)
     lines: List[Tuple[str, Optional[LocalBranchShortName]]] = []
 
     # Root branch — show ahead/behind vs remote tracking branch
@@ -741,7 +798,7 @@ class XtaxClient:
           if ahead != "0":
             parts_str.append(colored(f"{ahead}↑", AnsiEscapeCodes.GREEN))
           if parts_str:
-            root_info = f"  {dim('(')}{' '.join(parts_str)}{dim(')')}"
+            root_info = f"  {dim('→')}  {dim('(')}{' '.join(parts_str)}{dim(')')}"
     except Exception as e:
       debug(f"Failed to get ahead/behind for root {state.root}: {e}")
     lines.append((f"  {dim('○')} {dim(str(state.root))}{root_info}", None))
@@ -750,35 +807,27 @@ class XtaxClient:
     if not root_children:
       return lines
 
-    active_spines: set = set()
-
-    def spine_prefix(depth: int) -> str:
-      parts = []
-      for d in range(depth):
-        if d in active_spines:
-          parts.append(dim("│") + " ")
-        else:
-          parts.append("  ")
-      return ''.join(parts)
-
     def collect_node(branch: LocalBranchShortName, depth: int) -> None:
       info = self._branch_info_str(branch, state, highlighted, checked_out)
-      lines.append((f"  {spine_prefix(depth)}{info}", branch))
+      lines.append((info, branch))
 
       children = state.down_branches_for.get(branch, [])
-      if children:
-        active_spines.add(depth)
-        for child in children:
-          collect_node(child, depth + 1)
-        active_spines.discard(depth)
+      for child in children:
+        collect_node(child, depth + 1)
 
-    active_spines.add(0)
     for child in root_children:
       collect_node(child, 1)
-    active_spines.discard(0)
 
     # Reverse so root is at bottom and leaves at top (standard stack metaphor)
     lines.reverse()
+
+    # Assign connectors: ┌ on first managed branch, ├ on the rest
+    first = True
+    for i, (line, branch) in enumerate(lines):
+      if branch is not None:
+        connector = dim('┌') if first else dim('├')
+        lines[i] = (f"  {connector} {line}", branch)
+        first = False
 
     # Stack name header at the top
     lines.insert(0, (f"  Stack: {bold(name)}{self._xtax_ahead_behind_str()}", None))

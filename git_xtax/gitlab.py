@@ -108,6 +108,14 @@ class GitLabClient(CodeHostingClient):
     def get_pr_url(self, identifier: str) -> str:
         return f"https://{self.domain}/{self.organization}/{self.repository}/-/merge_requests/{identifier}"
 
+    def get_unresolved_comment_count(self, identifier: str) -> int:
+        discussions = self.__fire_gitlab_api_project_request(
+            method='GET', path_suffix=f'/merge_requests/{identifier}/discussions')
+        return sum(
+            1 for d in discussions
+            if any(n.get('resolvable') and not n.get('resolved') for n in d.get('notes', []))
+        )
+
     def has_token(self) -> bool:
         return self.__token is not None
 

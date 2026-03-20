@@ -158,6 +158,22 @@ class GitHubClient(CodeHostingClient):
     def get_pr_url(self, identifier: str) -> str:
         return f"https://{self.domain}/{self.organization}/{self.repository}/pull/{identifier}"
 
+    def get_unresolved_comment_count(self, identifier: str) -> int:
+        query = f"""query {{
+            repository(owner: "{self.organization}", name: "{self.repository}") {{
+                pullRequest(number: {identifier}) {{
+                    reviewThreads(first: 100) {{
+                        nodes {{
+                            isResolved
+                        }}
+                    }}
+                }}
+            }}
+        }}"""
+        response = self.__fire_github_graphql_api_request(query)
+        threads = response["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+        return sum(1 for t in threads if not t["isResolved"])
+
     def has_token(self) -> bool:
         return self.__token is not None
 

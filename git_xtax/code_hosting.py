@@ -215,6 +215,10 @@ class CodeHostingClient(metaclass=ABCMeta):  # pragma: no cover
         """Return the web URL for a PR/MR by identifier."""
 
     @abstractmethod
+    def get_unresolved_comment_count(self, identifier: str) -> int:
+        """Return the number of unresolved review comment threads."""
+
+    @abstractmethod
     def has_token(self) -> bool:
         pass
 
