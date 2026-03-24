@@ -9,7 +9,8 @@ from git_xtax.utils import bold
 
 class PullRequest:
     def __init__(self, identifier: str, display_prefix: str, user: str, base: str, head: str, head_repo_id: int,
-                 state: str, title: str, description: Optional[str], html_url: str):
+                 state: str, title: str, description: Optional[str], html_url: str,
+                 pipeline_status: Optional[str] = None, pipeline_finished_at: Optional[str] = None):
         self.__identifier = identifier
         self.__display_prefix = display_prefix
         self.__user = user
@@ -20,6 +21,8 @@ class PullRequest:
         self.__title = title
         self.__description = description
         self.__html_url = html_url
+        self.__pipeline_status = pipeline_status
+        self.__pipeline_finished_at = pipeline_finished_at
 
     def copy(self) -> "PullRequest":
         return PullRequest(
@@ -32,7 +35,9 @@ class PullRequest:
             state=self.__state,
             title=self.__title,
             description=self.__description,
-            html_url=self.__html_url
+            html_url=self.__html_url,
+            pipeline_status=self.__pipeline_status,
+            pipeline_finished_at=self.__pipeline_finished_at,
         )
 
     @property
@@ -82,6 +87,14 @@ class PullRequest:
     @property
     def html_url(self) -> str:
         return self.__html_url
+
+    @property
+    def pipeline_status(self) -> Optional[str]:
+        return self.__pipeline_status
+
+    @property
+    def pipeline_finished_at(self) -> Optional[str]:
+        return self.__pipeline_finished_at
 
     def short_display_text(self, fmt: bool = True) -> str:
         return self.display_text(fmt).split(" ")[1]
@@ -217,6 +230,10 @@ class CodeHostingClient(metaclass=ABCMeta):  # pragma: no cover
     @abstractmethod
     def get_unresolved_comment_count(self, identifier: str) -> int:
         """Return the number of unresolved review comment threads."""
+
+    @abstractmethod
+    def get_pr_approved(self, identifier: str) -> bool:
+        """Return whether the PR/MR has been approved."""
 
     @abstractmethod
     def has_token(self) -> bool:

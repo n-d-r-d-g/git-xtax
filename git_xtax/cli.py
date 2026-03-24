@@ -178,8 +178,9 @@ class XtaxClient:
     self._storage = storage
     self._hosting_info: Optional[Tuple[CodeHostingClient, CodeHostingSpec]] = None
     self._hosting_info_resolved: bool = False
-    self._pr_status_cache: Dict[str, Optional[str]] = {}
+    self._pr_cache: Dict[str, Optional[Any]] = {}  # identifier -> PullRequest or None
     self._pr_comment_count_cache: Dict[str, int] = {}
+    self._pr_approved_cache: Dict[str, Optional[bool]] = {}
 
   def _fetch_stacks(self) -> None:
     """Fetch and fast-forward _xtax from origin."""
@@ -264,6 +265,21 @@ class XtaxClient:
     match = re.match(pattern, text)
     return match.group(1) if match else None
 
+  @staticmethod
+  def _elapsed_str(finished_at: str) -> str:
+    """Return human-readable elapsed time since finished_at ISO timestamp."""
+    import datetime
+    finished = datetime.datetime.fromisoformat(finished_at.replace('Z', '+00:00'))
+    diff = int((datetime.datetime.now(datetime.timezone.utc) - finished).total_seconds())
+    if diff < 3600:
+      return f"{diff // 60}m"
+    elif diff < 86400:
+      return f"{diff // 3600}h"
+    elif diff < 86400 * 30:
+      return f"{diff // 86400}d"
+    else:
+      return f"{diff // (86400 * 30)}mo"
+
   def _get_pr_url(self, annotation: Optional[Annotation]) -> Optional[str]:
     """Build a web URL for the PR/MR in the annotation, if any."""
     if not self._hosting_info_resolved:
@@ -280,6 +296,16 @@ class XtaxClient:
       return None
     return client.get_pr_url(identifier)
 
+  def _get_cached_pr(self, annotation: Optional[Annotation]) -> Optional[Any]:
+    """Return cached PullRequest for the annotation, or None."""
+    if not self._hosting_info or not annotation:
+      return None
+    _, spec = self._hosting_info
+    identifier = self._extract_pr_identifier(annotation, spec)
+    if identifier is None:
+      return None
+    return self._pr_cache.get(identifier)
+
   def _get_pr_status(self, annotation: Optional[Annotation]) -> Optional[str]:
     """Return normalized PR/MR status: 'open', 'merged', 'closed', or None."""
     if not self._hosting_info_resolved:
@@ -288,19 +314,15 @@ class XtaxClient:
         self._hosting_info = self._get_code_hosting_client()
       except Exception:
         pass
-    if not self._hosting_info or not annotation:
-      return None
-    client, spec = self._hosting_info
-    identifier = self._extract_pr_identifier(annotation, spec)
-    if identifier is None:
-      return None
-    if identifier not in self._pr_status_cache:
-      try:
-        pr = client.get_pull_request_by_identifier_or_none(identifier)
-        self._pr_status_cache[identifier] = pr.state if pr else None
-      except Exception:
-        self._pr_status_cache[identifier] = None
-    return self._pr_status_cache[identifier]
+    pr = self._get_cached_pr(annotation)
+    return pr.state if pr else None
+
+  def _get_pr_pipeline(self, annotation: Optional[Annotation]) -> Tuple[Optional[str], Optional[str]]:
+    """Return (pipeline_status, pipeline_finished_at) for the PR/MR in the annotation."""
+    pr = self._get_cached_pr(annotation)
+    if not pr:
+      return None, None
+    return pr.pipeline_status, pr.pipeline_finished_at
 
   def _get_pr_unresolved_count(self, annotation: Optional[Annotation]) -> Optional[int]:
     """Return cached unresolved comment count for the PR/MR in the annotation."""
@@ -311,6 +333,16 @@ class XtaxClient:
     if identifier is None:
       return None
     return self._pr_comment_count_cache.get(identifier)
+
+  def _get_pr_approved(self, annotation: Optional[Annotation]) -> Optional[bool]:
+    """Return cached approval status for the PR/MR in the annotation."""
+    if not self._hosting_info or not annotation:
+      return None
+    _, spec = self._hosting_info
+    identifier = self._extract_pr_identifier(annotation, spec)
+    if identifier is None:
+      return None
+    return self._pr_approved_cache.get(identifier)
 
   def _prefetch_pr_data(self, state: XtaxState) -> None:
     """Prefetch PR status and unresolved comment count for all annotated branches in parallel."""
@@ -328,8 +360,9 @@ class XtaxClient:
     for annotation in state.annotations.values():
       identifier = self._extract_pr_identifier(annotation, spec)
       if identifier and (
-        identifier not in self._pr_status_cache or
-        identifier not in self._pr_comment_count_cache
+        identifier not in self._pr_cache or
+        identifier not in self._pr_comment_count_cache or
+        identifier not in self._pr_approved_cache
       ):
         to_fetch.append(identifier)
 
@@ -337,17 +370,21 @@ class XtaxClient:
       return
 
     def fetch_one(identifier: str) -> None:
-      if identifier not in self._pr_status_cache:
+      if identifier not in self._pr_cache:
         try:
-          pr = client.get_pull_request_by_identifier_or_none(identifier)
-          self._pr_status_cache[identifier] = pr.state if pr else None
+          self._pr_cache[identifier] = client.get_pull_request_by_identifier_or_none(identifier)
         except Exception:
-          self._pr_status_cache[identifier] = None
+          self._pr_cache[identifier] = None
       if identifier not in self._pr_comment_count_cache:
         try:
           self._pr_comment_count_cache[identifier] = client.get_unresolved_comment_count(identifier)
         except Exception:
           self._pr_comment_count_cache[identifier] = 0
+      if identifier not in self._pr_approved_cache:
+        try:
+          self._pr_approved_cache[identifier] = client.get_pr_approved(identifier)
+        except Exception:
+          self._pr_approved_cache[identifier] = None
 
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=min(len(to_fetch), 8)) as executor:
@@ -729,10 +766,43 @@ class XtaxClient:
       pr_url = self._get_pr_url(annotation)
       if pr_url:
         anno_text = hyperlink(anno_text, pr_url)
+      # Pipeline status
+      pipeline_status, pipeline_finished_at = self._get_pr_pipeline(annotation)
+      pipeline_str = ""
+      if pipeline_status:
+        pending_statuses = {'running', 'pending', 'created', 'waiting_for_resource', 'preparing', 'scheduled', 'manual'}
+        if pipeline_status == 'success':
+          pipeline_dot = colored('PASS', AnsiEscapeCodes.GREEN)
+        elif pipeline_status == 'failed':
+          pipeline_dot = colored('FAIL', AnsiEscapeCodes.RED)
+        elif pipeline_status in pending_statuses:
+          pipeline_dot = colored('PEND', AnsiEscapeCodes.YELLOW)
+        else:
+          pipeline_dot = dim('PEND')
+        approved = self._get_pr_approved(annotation)
+        if approved is True:
+          approval_str = colored('(✔)', AnsiEscapeCodes.GREEN)
+        elif approved is False:
+          approval_str = colored('(✔)', AnsiEscapeCodes.RED)
+        else:
+          approval_str = ""
+        pipeline_str = f" {pipeline_dot}{approval_str}"
+        if pipeline_status not in pending_statuses and pipeline_finished_at:
+          import datetime
+          diff = int((datetime.datetime.now(datetime.timezone.utc) -
+                      datetime.datetime.fromisoformat(pipeline_finished_at.replace('Z', '+00:00'))).total_seconds())
+          elapsed = self._elapsed_str(pipeline_finished_at)
+          elapsed_color = AnsiEscapeCodes.RED if diff >= 86400 else None
+          elapsed_inner = colored(elapsed, elapsed_color) if elapsed_color else dim(elapsed)
+          elapsed_str = f"{dim('(')}{elapsed_inner}{dim(')')}"
+          pipeline_str += elapsed_str
+      anno_text += pipeline_str
+
       unresolved = self._get_pr_unresolved_count(annotation)
       if unresolved:
         review_word = "review" if unresolved == 1 else "reviews"
-        anno_text += f" {dim('(')}{colored(f'{unresolved} {review_word}', AnsiEscapeCodes.YELLOW)}{dim(')')}"
+        anno_text += f"{dim('(')}{colored(f'{unresolved} {review_word}', AnsiEscapeCodes.YELLOW)}{dim(')')}"
+
       anno = f"  {dim('→')}  " + anno_text
 
     # Ahead/behind parent, colored by sync status

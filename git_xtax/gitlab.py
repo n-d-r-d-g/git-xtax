@@ -116,6 +116,11 @@ class GitLabClient(CodeHostingClient):
             if any(n.get('resolvable') and not n.get('resolved') for n in d.get('notes', []))
         )
 
+    def get_pr_approved(self, identifier: str) -> bool:
+        approvals = self.__fire_gitlab_api_project_request(
+            method='GET', path_suffix=f'/merge_requests/{identifier}/approvals')
+        return bool(approvals.get('approved'))
+
     def has_token(self) -> bool:
         return self.__token is not None
 
@@ -131,7 +136,9 @@ class GitLabClient(CodeHostingClient):
             html_url=mr_json['web_url'],
             state='open' if mr_json['state'] == 'opened' else mr_json['state'],
             title=mr_json['title'],
-            description=mr_json['description'])
+            description=mr_json['description'],
+            pipeline_status=(mr_json.get('head_pipeline') or {}).get('status'),
+            pipeline_finished_at=(mr_json.get('head_pipeline') or {}).get('finished_at'))
 
     def __fire_gitlab_api_request(self, method: str, path: str, request_body: Optional[Dict[str, Any]] = None) -> Any:  # noqa: KW
         headers: Dict[str, str] = {

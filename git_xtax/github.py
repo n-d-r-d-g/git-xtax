@@ -158,6 +158,10 @@ class GitHubClient(CodeHostingClient):
     def get_pr_url(self, identifier: str) -> str:
         return f"https://{self.domain}/{self.organization}/{self.repository}/pull/{identifier}"
 
+    def get_pr_approved(self, identifier: str) -> bool:
+        reviews = self.__fire_github_api_repo_request(method='GET', path_suffix=f'/pulls/{identifier}/reviews')
+        return any(r.get('state') == 'APPROVED' for r in reviews)
+
     def get_unresolved_comment_count(self, identifier: str) -> int:
         query = f"""query {{
             repository(owner: "{self.organization}", name: "{self.repository}") {{
