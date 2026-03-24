@@ -934,6 +934,8 @@ class XtaxClient:
       return 'delete'
     elif ch == 'r':
       return 'rename'
+    elif ch == 'c':
+      return 'commits'
     return ''
 
   def _read_key_unix(self) -> str:
@@ -969,6 +971,8 @@ class XtaxClient:
         return 'delete'
       elif ch == b'r':
         return 'rename'
+      elif ch == b'c':
+        return 'commits'
       return ''
     finally:
       termios.tcsetattr(fd, termios.TCSADRAIN, old)
@@ -1069,7 +1073,7 @@ class XtaxClient:
         return
       cursor = min(cursor, len(managed) - 1)
 
-      hint = f"s{dim(': stack')}  t{dim(': tuck')}  r{dim(': rename')}  d{dim(': slide out')}"
+      hint = f"s{dim(': stack')}  t{dim(': tuck')}  r{dim(': rename')}  d{dim(': slide out')}  c{dim(': view commits')}"
 
       def render_lines(cursor_idx: int) -> List[str]:
         highlighted = managed[cursor_idx]
@@ -1119,7 +1123,7 @@ class XtaxClient:
             for line, _ in self._build_view_lines(name, state, current):
               print(line)
             return
-          elif key in ('stack', 'tuck', 'delete', 'rename'):
+          elif key in ('stack', 'tuck', 'delete', 'rename', 'commits'):
             action = key
             self._exit_interactive(num_lines)
             break
@@ -1170,6 +1174,30 @@ class XtaxClient:
             self.cmd_rename_branch([str(selected_branch), new_name])
           except XtaxException as e:
             print(colored(f"Error: {e}", AnsiEscapeCodes.RED))
+      elif action == 'commits':
+        parent = state.up_branch_for.get(selected_branch, state.root)
+        result = self._git._popen_git(
+          'log', f'{parent}..{selected_branch}', '--pretty=format:%h %s', allow_non_zero=True)
+        lines_out = ["", f"Branch: {bold(str(selected_branch))}", ""]
+        if result.stdout.strip():
+          for commit_line in result.stdout.rstrip().splitlines():
+            parts = commit_line.split(' ', 1)
+            if len(parts) == 2:
+              hash_str, message = parts
+              lines_out.append(f"  {colored(hash_str, AnsiEscapeCodes.YELLOW)} {message}")
+            else:
+              lines_out.append(f"  {commit_line}")
+        else:
+          lines_out.append(dim(f"  No commits between {parent} and {selected_branch}"))
+        lines_out.append("")
+        lines_out.append(dim("Press Esc to return..."))
+        print('\n'.join(lines_out))
+        sys.stdout.flush()
+        while self._read_key() != 'escape':
+          pass
+        # Clear the commits output
+        sys.stdout.write(f"\x1b[{len(lines_out)}A\r\x1b[J")
+        sys.stdout.flush()
 
       # Loop back to re-render interactive view
 
