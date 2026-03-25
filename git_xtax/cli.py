@@ -768,8 +768,9 @@ class XtaxClient:
         anno_text = hyperlink(anno_text, pr_url)
       # Pipeline status
       pipeline_status, pipeline_finished_at = self._get_pr_pipeline(annotation)
+      pr = self._get_cached_pr(annotation)
       pipeline_str = ""
-      if pipeline_status:
+      if pr is not None:
         pending_statuses = {'running', 'pending', 'created', 'waiting_for_resource', 'preparing', 'scheduled', 'manual'}
         if pipeline_status == 'success':
           pipeline_dot = colored('PASS', AnsiEscapeCodes.GREEN)
@@ -778,7 +779,7 @@ class XtaxClient:
         elif pipeline_status in pending_statuses:
           pipeline_dot = colored('PEND', AnsiEscapeCodes.YELLOW)
         else:
-          pipeline_dot = dim('PEND')
+          pipeline_dot = colored('UNKW', AnsiEscapeCodes.PURPLE)
         approved = self._get_pr_approved(annotation)
         if approved is True:
           approval_str = colored('(✔)', AnsiEscapeCodes.GREEN)

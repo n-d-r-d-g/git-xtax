@@ -379,6 +379,7 @@ class AnsiEscapeCodes:
     ORANGE = '\033[00;38;5;208m' if __is_terminal_fully_fledged else '\033[33m'
     # Let's fall back to dark red (which might be similar to yellow :/) on 8-color terminals
     RED = '\033[91m' if __is_terminal_fully_fledged else '\033[31m'
+    PURPLE = '\033[38;2;147;112;219m'
     REVERSE_VIDEO = '\033[7m'
 
     # Cursor control
