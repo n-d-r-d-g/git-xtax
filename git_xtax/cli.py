@@ -1225,19 +1225,22 @@ class XtaxClient:
             self._pr_cache[identifier] = pr
             if pr and str(pr.base) != str(state.root):
               print(colored(f"Warning: {pr_label} targets {bold(str(pr.base))}, not {bold(str(state.root))}", AnsiEscapeCodes.YELLOW))
-            confirm = input(rl_safe(f"Merge {bold(pr_label)} and slide out {bold(selected_branch)}? [y/N] ")).strip()
+            target = str(pr.base) if pr else str(state.root)
+            confirm = input(rl_safe(f"Merge {bold(str(selected_branch))} into {bold(target)} ({pr_label})? [y/N] ")).strip()
             if confirm.lower() in ('y', 'yes'):
               try:
                 client.merge_pull_request(identifier)
                 print(f"Merged {bold(pr_label)}")
-                was_checked_out = current == selected_branch
-                children = state.down_branches_for.get(selected_branch, [])
-                self.cmd_slideout([str(selected_branch)], stack_name=name)
-                if was_checked_out:
-                  checkout_target = children[0] if children else state.root
-                  if checkout_target:
-                    self._git.checkout(LocalBranchShortName.of(str(checkout_target)))
-                cursor = max(0, cursor - 1)
+                slide = input(rl_safe(f"Slide out {bold(selected_branch)} from stack? [y/N] ")).strip()
+                if slide.lower() in ('y', 'yes'):
+                  was_checked_out = current == selected_branch
+                  children = state.down_branches_for.get(selected_branch, [])
+                  self.cmd_slideout([str(selected_branch)], stack_name=name)
+                  if was_checked_out:
+                    checkout_target = children[0] if children else state.root
+                    if checkout_target:
+                      self._git.checkout(LocalBranchShortName.of(str(checkout_target)))
+                  cursor = max(0, cursor - 1)
               except XtaxException as e:
                 print(colored(f"Error: {e}", AnsiEscapeCodes.RED))
               except Exception as e:
