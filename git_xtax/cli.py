@@ -937,6 +937,8 @@ class XtaxClient:
       return 'rename'
     elif ch == 'c':
       return 'commits'
+    elif ch == 'm':
+      return 'merge'
     return ''
 
   def _read_key_unix(self) -> str:
@@ -974,6 +976,8 @@ class XtaxClient:
         return 'rename'
       elif ch == b'c':
         return 'commits'
+      elif ch == b'm':
+        return 'merge'
       return ''
     finally:
       termios.tcsetattr(fd, termios.TCSADRAIN, old)
@@ -1074,7 +1078,7 @@ class XtaxClient:
         return
       cursor = min(cursor, len(managed) - 1)
 
-      hint = f"s{dim(': stack')}  t{dim(': tuck')}  r{dim(': rename')}  d{dim(': slide out')}  c{dim(': view commits')}"
+      hint = f"s{dim(': stack')}  t{dim(': tuck')}  r{dim(': rename')}  d{dim(': slide out')}  c{dim(': view commits')}  m{dim(': merge')}"
 
       def render_lines(cursor_idx: int) -> List[str]:
         highlighted = managed[cursor_idx]
@@ -1124,7 +1128,7 @@ class XtaxClient:
             for line, _ in self._build_view_lines(name, state, current):
               print(line)
             return
-          elif key in ('stack', 'tuck', 'delete', 'rename', 'commits'):
+          elif key in ('stack', 'tuck', 'delete', 'rename', 'commits', 'merge'):
             action = key
             self._exit_interactive(num_lines)
             break
@@ -1199,6 +1203,29 @@ class XtaxClient:
         # Clear the commits output
         sys.stdout.write(f"\x1b[{len(lines_out)}A\r\x1b[J")
         sys.stdout.flush()
+      elif action == 'merge':
+        annotation = state.annotations.get(selected_branch)
+        hosting = self._get_code_hosting_client()
+        if not hosting:
+          print(colored("Error: no code hosting client configured", AnsiEscapeCodes.RED))
+        else:
+          client, spec = hosting
+          identifier = self._extract_pr_identifier(annotation, spec)
+          if not identifier:
+            print(colored(f"Error: no {spec.pr_short_name} found for {selected_branch}", AnsiEscapeCodes.RED))
+          else:
+            pr_label = f"{spec.pr_short_name} {spec.pr_ordinal_char}{identifier}"
+            confirm = input(rl_safe(f"Merge {bold(pr_label)} and slide out {bold(selected_branch)}? [y/N] ")).strip()
+            if confirm.lower() in ('y', 'yes'):
+              try:
+                client.merge_pull_request(identifier)
+                print(f"Merged {bold(pr_label)}")
+                self.cmd_slideout([str(selected_branch)], stack_name=name)
+                cursor = max(0, cursor - 1)
+              except XtaxException as e:
+                print(colored(f"Error: {e}", AnsiEscapeCodes.RED))
+              except Exception as e:
+                print(colored(f"Merge failed: {e}", AnsiEscapeCodes.RED))
 
       # Loop back to re-render interactive view
 

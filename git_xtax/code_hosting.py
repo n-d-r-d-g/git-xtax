@@ -270,6 +270,10 @@ class CodeHostingClient(metaclass=ABCMeta):  # pragma: no cover
         Returns false if PR already had the desired draft status, and hence draft status has NOT been toggled."""
 
     @abstractmethod
+    def merge_pull_request(self, identifier: str) -> None:
+        pass
+
+    @abstractmethod
     def get_open_pull_requests_by_head(self, head: LocalBranchShortName) -> List[PullRequest]:
         pass
 

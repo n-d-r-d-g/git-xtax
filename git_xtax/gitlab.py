@@ -314,6 +314,9 @@ class GitLabClient(CodeHostingClient):
         self.__fire_gitlab_api_project_request(method='PUT', path_suffix=f'/merge_requests/{identifier}', request_body=request_body)
         return True
 
+    def merge_pull_request(self, identifier: str) -> None:
+        self.__fire_gitlab_api_project_request(method='PUT', path_suffix=f'/merge_requests/{identifier}/merge')
+
     def get_open_pull_requests_by_head(self, head: LocalBranchShortName) -> List[PullRequest]:
         mrs = self.__fire_gitlab_api_project_request(method='GET', path_suffix=f'/merge_requests?state=opened&source_branch={head}')
         return [self.__get_merge_request_from_json(mr) for mr in mrs]

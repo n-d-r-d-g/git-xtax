@@ -413,6 +413,9 @@ class GitHubClient(CodeHostingClient):
         debug(f"mutation response is {response}")
         return True
 
+    def merge_pull_request(self, identifier: str) -> None:
+        self.__fire_github_api_repo_request(method='PUT', path_suffix=f'/pulls/{identifier}/merge')
+
     def get_open_pull_requests_by_head(self, head: LocalBranchShortName) -> List[PullRequest]:
         prs = self.__fire_github_api_repo_request(method='GET', path_suffix=f'/pulls?head={self.organization}:{head}')
         return [self.__get_pull_request_from_json(pr) for pr in prs]
