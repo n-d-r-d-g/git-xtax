@@ -1205,7 +1205,13 @@ class XtaxClient:
         sys.stdout.flush()
       elif action == 'merge':
         annotation = state.annotations.get(selected_branch)
-        hosting = self._get_code_hosting_client()
+        if not self._hosting_info_resolved:
+          self._hosting_info_resolved = True
+          try:
+            self._hosting_info = self._get_code_hosting_client()
+          except Exception:
+            pass
+        hosting = self._hosting_info
         if not hosting:
           print(colored("Error: no code hosting client configured", AnsiEscapeCodes.RED))
         else:
@@ -1215,12 +1221,22 @@ class XtaxClient:
             print(colored(f"Error: no {spec.pr_short_name} found for {selected_branch}", AnsiEscapeCodes.RED))
           else:
             pr_label = f"{spec.pr_short_name} {spec.pr_ordinal_char}{identifier}"
+            pr = client.get_pull_request_by_identifier_or_none(identifier)
+            self._pr_cache[identifier] = pr
+            if pr and str(pr.base) != str(state.root):
+              print(colored(f"Warning: {pr_label} targets {bold(str(pr.base))}, not {bold(str(state.root))}", AnsiEscapeCodes.YELLOW))
             confirm = input(rl_safe(f"Merge {bold(pr_label)} and slide out {bold(selected_branch)}? [y/N] ")).strip()
             if confirm.lower() in ('y', 'yes'):
               try:
                 client.merge_pull_request(identifier)
                 print(f"Merged {bold(pr_label)}")
+                was_checked_out = current == selected_branch
+                children = state.down_branches_for.get(selected_branch, [])
                 self.cmd_slideout([str(selected_branch)], stack_name=name)
+                if was_checked_out:
+                  checkout_target = children[0] if children else state.root
+                  if checkout_target:
+                    self._git.checkout(LocalBranchShortName.of(str(checkout_target)))
                 cursor = max(0, cursor - 1)
               except XtaxException as e:
                 print(colored(f"Error: {e}", AnsiEscapeCodes.RED))
