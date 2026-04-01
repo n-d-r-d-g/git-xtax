@@ -738,17 +738,18 @@ class XtaxClient:
     is_highlighted = branch == highlighted
     is_checked_out = branch == (checked_out if checked_out is not None else highlighted)
 
+    pointer = "❯ " if is_highlighted else "  "
     if is_highlighted:
       if is_checked_out:
         node = colored("◉", active_color)
-        branch_str = f"{node} " + colored(bold(str(branch)), active_color)
+        branch_str = f"{pointer}{node} " + colored(bold(str(branch)), active_color)
       else:
         node = "◉"
-        branch_str = f"{node} " + bold(str(branch))
+        branch_str = f"{pointer}{node} " + bold(str(branch))
     elif is_checked_out:
-      branch_str = f"{dim('○')} " + colored(str(branch), active_color)
+      branch_str = f"{pointer}{dim('○')} " + colored(str(branch), active_color)
     else:
-      branch_str = f"{dim('○')} " + str(branch)
+      branch_str = f"{pointer}{dim('○')} " + dim(str(branch))
 
     # Annotation
     anno = ""
@@ -872,7 +873,7 @@ class XtaxClient:
             root_info = f"  {dim('→')}  {dim('(')}{' '.join(parts_str)}{dim(')')}"
     except Exception as e:
       debug(f"Failed to get ahead/behind for root {state.root}: {e}")
-    lines.append((f"  {dim('▲')} {dim(str(state.root))}{root_info}", None))
+    lines.append((f"    {dim('▲')} {dim(str(state.root))}{root_info}", None))
 
     root_children = state.down_branches_for.get(state.root, [])
     if not root_children:
@@ -891,6 +892,12 @@ class XtaxClient:
 
     # Reverse so root is at bottom and leaves at top (standard stack metaphor)
     lines.reverse()
+
+    # Insert connector lines between branches
+    i = 1
+    while i < len(lines):
+      lines.insert(i, (f"    {dim('│')}", None))
+      i += 2
 
     # Add indentation for managed branches
     for i, (line, branch) in enumerate(lines):
@@ -1700,19 +1707,22 @@ class XtaxClient:
         root = "?"
       roots.setdefault(root, []).append(s)
 
-    print(f"  {dim('_xtax')}{self._xtax_ahead_behind_str()}")
+    print()
+    print(f"{dim('_xtax')}{self._xtax_ahead_behind_str()}")
 
     for root, stack_names in roots.items():
       print()
       print(f"  {dim(root)}")
       for s in stack_names:
         if s == current_stack:
+          pointer = "❯ "
           node = colored("◉", AnsiEscapeCodes.GREEN)
           name_str = colored(s, AnsiEscapeCodes.GREEN)
         else:
+          pointer = "  "
           node = dim("○")
           name_str = dim(s)
-        print(f"  {dim('│')} {node} {name_str}")
+        print(f"  {pointer}{node} {name_str}")
 
   def _interactive_stack_select(self, stacks: List[str],
                                  current_stack: Optional[str]
@@ -1730,6 +1740,7 @@ class XtaxClient:
       roots.setdefault(root, []).append(s)
 
     entries: List[Tuple[Optional[str], Optional[str]]] = []
+    entries.append(('__separator__', None))
     entries.append(('__xtax_header__', None))
     for root, stack_names in roots.items():
       entries.append(('__separator__', None))
@@ -1755,7 +1766,7 @@ class XtaxClient:
       out = []
       for root_name, stack_name in entries:
         if root_name == '__xtax_header__':
-          out.append(f"  {dim('_xtax')}{xtax_info}")
+          out.append(f"{dim('_xtax')}{xtax_info}")
         elif root_name == '__separator__':
           out.append("")
         elif root_name is not None:
@@ -1763,17 +1774,20 @@ class XtaxClient:
         else:
           is_active = stack_name == current_stack
           if stack_name == highlighted:
+            pointer = "❯ "
             node = colored("◉", AnsiEscapeCodes.GREEN) if is_active else "◉"
             name_str = colored(bold(stack_name), AnsiEscapeCodes.GREEN) if is_active else bold(stack_name)
           elif is_active:
+            pointer = "  "
             node = colored("○", AnsiEscapeCodes.GREEN)
             name_str = colored(stack_name, AnsiEscapeCodes.GREEN)
           else:
+            pointer = "  "
             node = dim("○")
             name_str = dim(stack_name)
-          out.append(f"  {dim('│')} {node} {name_str}")
+          out.append(f"  {pointer}{node} {name_str}")
       out.append("")
-      out.append(f"  r{dim(': rename')}  d{dim(': delete')}")
+      out.append(f"r{dim(': rename')}  d{dim(': delete')}")
       return '\n'.join(out)
 
     num_lines = len(entries) + 2
