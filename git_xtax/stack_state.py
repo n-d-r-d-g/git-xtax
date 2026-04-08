@@ -202,7 +202,22 @@ class StackStorage:
   def push_stacks(self, remote: str = 'origin') -> None:
     exit_code = run_cmd('git', 'push', remote, self.BRANCH)
     if exit_code != 0:
-      raise XtaxException(f"Failed to push stacks to {remote}")
+      # Local _xtax may be behind remote — replay local tree on top of remote
+      remote_ref = f'{remote}/{self.BRANCH}'
+      popen_cmd('git', 'fetch', remote, self.BRANCH)
+      _, remote_hash, _ = popen_cmd('git', 'rev-parse', remote_ref)
+      remote_hash = remote_hash.strip()
+      # Get the tree of the local _xtax (our desired state)
+      _, local_tree, _ = popen_cmd('git', 'rev-parse', f'{self.BRANCH}^{{tree}}')
+      local_tree = local_tree.strip()
+      # Create a new commit with our tree on top of the remote
+      _, new_commit, _ = popen_cmd(
+        'git', 'commit-tree', local_tree, '-p', remote_hash, '-m', 'xtax: sync stack metadata')
+      new_commit = new_commit.strip()
+      popen_cmd('git', 'update-ref', f'refs/heads/{self.BRANCH}', new_commit)
+      exit_code = run_cmd('git', 'push', remote, self.BRANCH)
+      if exit_code != 0:
+        raise XtaxException(f"Failed to push stacks to {remote}")
 
   def fetch_and_fast_forward(self, remote: str = 'origin') -> Optional[str]:
     """Fetch remote _xtax and fast-forward local ref if behind.
