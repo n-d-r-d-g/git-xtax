@@ -56,10 +56,11 @@ usage: git xtax <command> [<args>]
   <N>                                   Go N up (positive) or down (negative); 0 = leaf
 
 {bold('Sync & share:')}
-  s, sync [--current|--cascade] [--continue]
+  s, sync [--current|--cascade] [--continue] [--include-merged]
                                         Rebase + push entire stack
                                         --current: current branch only
                                         --cascade: current branch and above
+                                        --include-merged: also sync branches with merged MRs
   push                                  Push stacks to remote
   pull                                  Pull stacks from remote
 
@@ -1353,6 +1354,7 @@ class XtaxClient:
     is_continue = '--continue' in args
     is_current_only = '--current' in args
     is_cascade = '--cascade' in args
+    include_merged = '--include-merged' in args
 
     if is_continue:
       self._sync_continue()
@@ -1416,6 +1418,18 @@ class XtaxClient:
       root_children = state.down_branches_for.get(state.root, [])
       for child in root_children:
         branches_to_sync.extend(self._get_dfs_order(state, child))
+
+    if not include_merged:
+      self._prefetch_pr_data(state)
+      filtered = []
+      for branch in branches_to_sync:
+        annotation = state.annotations.get(branch)
+        status = self._get_pr_status(annotation)
+        if status == 'merged':
+          print(dim(f"Skipping {bold(branch)} (MR already merged)"))
+        else:
+          filtered.append(branch)
+      branches_to_sync = filtered
 
     self._sync_branches(name, state, branches_to_sync, start_index=0,
                         original_branch=str(current))
