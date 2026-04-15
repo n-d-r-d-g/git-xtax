@@ -36,7 +36,7 @@ USAGE = f"""\
 usage: git xtax <command> [<args>]
 
 {bold('Stack management:')}
-  init <name> <branch> [--root=<base>]  Create a new stack
+  init                                  Create a new stack (interactive)
   stack <branch> [--onto=<parent>]      Add branch above current branch (or --onto parent)
   tuck <branch>                         Add branch below current branch
   slideout <branch>                     Slide branch out of stack
@@ -452,6 +452,13 @@ class XtaxClient:
       raise XtaxException("Not on any branch (detached HEAD)")
     return branch
 
+  @staticmethod
+  def _input_with_prefill(prompt: str, prefill: str) -> str:
+    label = prompt.rstrip(": ")
+    hint = dim(f"[press Enter for {prefill}]")
+    result = input(f"{label} {hint}: ").strip()
+    return result if result else prefill
+
   def _resolve_stack_for_branch(self, branch: LocalBranchShortName) -> Tuple[str, XtaxState]:
     """Find the stack that contains a managed branch."""
     stack_name = self._storage.find_stack_for_branch(branch)
@@ -474,33 +481,47 @@ class XtaxClient:
 
   def cmd_init(self, args: List[str]) -> None:
     self._fetch_stacks()
-    if len(args) < 2:
-      # Check for --root in args to give better error
-      positional = [a for a in args if not a.startswith('--')]
+
+    existing = self._storage.list_stacks()
+
+    if args:
+      # Legacy: git xtax init <name> <branch> [--root=<base>]
+      root_arg: Optional[str] = None
+      positional = []
+      for arg in args:
+        if arg.startswith('--root='):
+          root_arg = arg[len('--root='):]
+        else:
+          positional.append(arg)
       if len(positional) < 2:
         raise XtaxException("Usage: git xtax init <stack> <branch> [--root=<base>]")
-
-    root: Optional[str] = None
-    positional = []
-    for arg in args:
-      if arg.startswith('--root='):
-        root = arg[len('--root='):]
+      name = positional[0]
+      first_branch_name = positional[1]
+      root = root_arg if root_arg else str(self._current_branch())
+    else:
+      # Interactive mode
+      name = input(rl_safe("Stack name: ")).strip()
+      if not name:
+        raise XtaxException("Aborted")
+      if name in existing:
+        raise XtaxException(f"Stack {bold(name)} already exists")
+      current = self._git.get_currently_checked_out_branch_or_none()
+      default_branch = str(current) if current else ""
+      first_branch_name = self._input_with_prefill("First branch name: ", default_branch)
+      if not first_branch_name:
+        raise XtaxException("Aborted")
+      # Detect the repo's default branch (e.g. main, master, develop)
+      result = self._git._popen_git('symbolic-ref', 'refs/remotes/origin/HEAD', allow_non_zero=True)
+      if result.exit_code == 0:
+        default_root = result.stdout.strip().replace('refs/remotes/origin/', '')
       else:
-        positional.append(arg)
+        default_root = "main"
+      root = self._input_with_prefill("Root branch: ", default_root)
+      if not root:
+        raise XtaxException("Aborted")
 
-    if len(positional) < 2:
-      raise XtaxException("Usage: git xtax init <stack> <branch> [--root=<base>]")
-
-    name = positional[0]
-    first_branch_name = positional[1]
-
-    # Check if stack already exists
-    existing = self._storage.list_stacks()
     if name in existing:
       raise XtaxException(f"Stack {bold(name)} already exists")
-
-    if root is None:
-      root = str(self._current_branch())
 
     # Check that first branch isn't already in another stack
     first_branch = LocalBranchShortName.of(first_branch_name)
