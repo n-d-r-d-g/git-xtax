@@ -206,9 +206,11 @@ class XtaxClient:
     try:
       hosting = self._get_code_hosting_client()
       if not hosting:
+        debug("No code hosting client available for MR linking")
         return
       client, spec = hosting
-    except Exception:
+    except Exception as e:
+      debug(f"Failed to get code hosting client for MR linking: {e}")
       return
 
     stacks = self._storage.list_stacks()
@@ -1872,9 +1874,12 @@ class XtaxClient:
     elif result == 'ahead':
       print(f"Local stacks are ahead of {remote} (nothing to pull)")
     elif result == 'diverged':
-      print(f"Local and remote stacks have diverged. Run `gx push` to rebase and sync.")
+      self._resolve_xtax_divergence()
+      print(f"Merged diverged stacks from {remote}")
     else:
       print(f"Stacks already up to date with {remote}")
+
+    self._link_unlinked_mrs()
 
   def _cmd_view_all(self, args: List[str]) -> None:
     while True:
