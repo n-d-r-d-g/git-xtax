@@ -1229,6 +1229,7 @@ class XtaxClient:
     sys.stdout.flush()
 
   def cmd_list(self, args: List[str]) -> None:
+    self._link_unlinked_mrs()
     return self._cmd_view_all(args)
 
   def _print_view(self) -> None:
@@ -1239,6 +1240,7 @@ class XtaxClient:
       print(line)
 
   def cmd_view(self, args: List[str], stack_name: Optional[str] = None) -> Optional[str]:
+    self._link_unlinked_mrs()
     if stack_name:
       content = self._storage.read_stack_definition(stack_name)
       if content is None:
