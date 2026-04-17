@@ -199,6 +199,48 @@ class XtaxClient:
       raise
     except Exception as e:
       debug(f"Failed to fetch stacks: {e}")
+    self._link_unlinked_mrs()
+
+  def _link_unlinked_mrs(self) -> None:
+    """Find branches with open MRs on the forge but no annotation in the stack YAML."""
+    try:
+      hosting = self._get_code_hosting_client()
+      if not hosting:
+        return
+      client, spec = hosting
+    except Exception:
+      return
+
+    stacks = self._storage.list_stacks()
+    for stack_name in stacks:
+      content = self._storage.read_stack_definition(stack_name)
+      if not content:
+        continue
+      state = StackStorage.parse_definition(content)
+      changed = False
+
+      for branch in state.managed_branches:
+        annotation = state.annotations.get(branch)
+        identifier = self._extract_pr_identifier(annotation, spec)
+        if identifier is not None:
+          continue  # Already has an MR linked
+
+        # Check forge for an open MR with this branch as source
+        try:
+          open_prs = client.get_open_pull_requests_by_head(branch)
+          if open_prs:
+            pr = open_prs[0]
+            pr_text = f"{spec.pr_short_name} {spec.pr_ordinal_char}{pr.identifier}"
+            if annotation and annotation.qualifiers.is_non_default():
+              pr_text = f"{pr_text} {annotation.qualifiers}"
+            state.annotations[branch] = Annotation.parse(pr_text)
+            changed = True
+            print(dim(f"Linked {pr_text} to {bold(str(branch))}"))
+        except Exception as e:
+          debug(f"Failed to check MR for {branch}: {e}")
+
+      if changed:
+        self._save_state(stack_name, state)
 
   def _resolve_xtax_divergence(self) -> None:
     """Resolve divergence between local and remote _xtax using three-way merge."""
