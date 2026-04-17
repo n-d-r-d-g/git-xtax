@@ -193,10 +193,172 @@ class XtaxClient:
         print(dim("Fetched stack data from origin (updated)"))
       elif result == 'ahead':
         print(dim("Stack data has local changes not yet pushed"))
+      elif result == 'diverged':
+        self._resolve_xtax_divergence()
     except XtaxException:
       raise
     except Exception as e:
       debug(f"Failed to fetch stacks: {e}")
+
+  def _resolve_xtax_divergence(self) -> None:
+    """Resolve divergence between local and remote _xtax using three-way merge."""
+    branch = self._storage.BRANCH
+    remote_ref = f'origin/{branch}'
+
+    from git_xtax.stack_state import popen_cmd
+    _, ancestor_hash, _ = popen_cmd('git', 'merge-base', branch, remote_ref)
+    ancestor_hash = ancestor_hash.strip()
+
+    _, local_diff, _ = popen_cmd('git', 'diff', '--name-only', ancestor_hash, branch)
+    local_changed = set(f for f in local_diff.strip().splitlines() if f and f.startswith('stacks/'))
+    _, remote_diff, _ = popen_cmd('git', 'diff', '--name-only', ancestor_hash, remote_ref)
+    remote_changed = set(f for f in remote_diff.strip().splitlines() if f and f.startswith('stacks/'))
+
+    conflicts = local_changed & remote_changed
+    local_only = local_changed - remote_changed
+
+    if not conflicts:
+      # No conflicting files — merge automatically
+      self._merge_xtax_trees(local_only, set(), branch, remote_ref, ancestor_hash)
+      return
+
+    # Three-way merge conflicting files using git merge-file
+    import tempfile as _tempfile
+    conflict_dir = os.path.join(self._git._root_dir, '.git', 'xtax-conflicts')
+    os.makedirs(conflict_dir, exist_ok=True)
+
+    has_unresolved = False
+    resolved_files: Dict[str, str] = {}  # path -> merged content
+
+    for path in sorted(conflicts):
+      # Extract base, local, remote versions to temp files
+      base_file = _tempfile.NamedTemporaryFile(mode='w', suffix='.yml', delete=False)
+      local_file = _tempfile.NamedTemporaryFile(mode='w', suffix='.yml', delete=False)
+      remote_file = _tempfile.NamedTemporaryFile(mode='w', suffix='.yml', delete=False)
+      try:
+        ec, base_content, _ = popen_cmd('git', 'show', f'{ancestor_hash}:{path}')
+        base_file.write(base_content if ec == 0 else '')
+        base_file.close()
+
+        _, local_content, _ = popen_cmd('git', 'show', f'{branch}:{path}')
+        local_file.write(local_content)
+        local_file.close()
+
+        _, remote_content, _ = popen_cmd('git', 'show', f'{remote_ref}:{path}')
+        remote_file.write(remote_content)
+        remote_file.close()
+
+        # git merge-file modifies local_file in place, returns 0 if clean merge
+        merge_ec, _, _ = popen_cmd(
+          'git', 'merge-file',
+          '-L', 'local', '-L', 'base', '-L', 'remote',
+          local_file.name, base_file.name, remote_file.name)
+
+        with open(local_file.name) as f:
+          merged_content = f.read()
+
+        if merge_ec == 0:
+          # Clean merge — no conflicts
+          resolved_files[path] = merged_content
+        else:
+          # Has conflict markers — write to conflict dir for user to resolve
+          has_unresolved = True
+          conflict_path = os.path.join(conflict_dir, os.path.basename(path))
+          with open(conflict_path, 'w') as f:
+            f.write(merged_content)
+      finally:
+        os.unlink(base_file.name)
+        os.unlink(local_file.name)
+        os.unlink(remote_file.name)
+
+    if has_unresolved:
+      print(colored("Stack metadata has conflicts that need to be resolved.", AnsiEscapeCodes.YELLOW))
+      print(f"Conflicted files are in: {bold(conflict_dir)}")
+      print(f"Resolve the conflicts, then run: {bold('git xtax push --continue')}")
+      # Save merge state
+      self._storage.save_merge_state({
+        'ancestor': ancestor_hash,
+        'local_only': list(local_only),
+        'resolved': {k: v for k, v in resolved_files.items()},
+        'conflict_files': [os.path.basename(p) for p in conflicts if
+                           os.path.exists(os.path.join(conflict_dir, os.path.basename(p)))],
+      })
+      raise XtaxException("Resolve stack metadata conflicts before continuing")
+
+    # All conflicts resolved cleanly — merge everything
+    all_local = local_only | set(resolved_files.keys())
+    self._merge_xtax_trees(all_local, resolved_files, branch, remote_ref, ancestor_hash)
+
+  def _merge_xtax_trees(self, local_files: set, resolved_content: Dict[str, str],
+                         branch: str, remote_ref: str, ancestor_hash: str) -> None:
+    """Merge _xtax by starting from remote tree and overlaying local/resolved files."""
+    import tempfile
+    from git_xtax.stack_state import popen_cmd
+
+    _, remote_hash, _ = popen_cmd('git', 'rev-parse', remote_ref)
+    remote_hash = remote_hash.strip()
+
+    if not local_files and not resolved_content:
+      popen_cmd('git', 'update-ref', f'refs/heads/{branch}', remote_hash)
+      return
+
+    tmp_index = tempfile.mktemp(prefix='xtax-merge-index-')
+    try:
+      env = {**os.environ, 'GIT_INDEX_FILE': tmp_index}
+      popen_cmd('git', 'read-tree', remote_ref, env=env)
+
+      for path in local_files:
+        if path in resolved_content:
+          # Use the cleanly merged content
+          ec, blob_hash_out, _ = popen_cmd(
+            'git', 'hash-object', '-w', '--stdin', input=resolved_content[path])
+          blob_hash = blob_hash_out.strip()
+          popen_cmd('git', 'update-index', '--add', '--cacheinfo', '100644', blob_hash, path, env=env)
+        else:
+          # Use local version as-is
+          ec, blob_out, _ = popen_cmd('git', 'rev-parse', f'{branch}:{path}')
+          if ec == 0:
+            popen_cmd('git', 'update-index', '--add', '--cacheinfo', '100644', blob_out.strip(), path, env=env)
+          else:
+            popen_cmd('git', 'update-index', '--force-remove', path, env=env)
+
+      _, tree_out, _ = popen_cmd('git', 'write-tree', env=env)
+      merged_tree = tree_out.strip()
+
+      _, commit_out, _ = popen_cmd(
+        'git', 'commit-tree', merged_tree, '-p', remote_hash, '-m', 'xtax: merge stack metadata')
+      popen_cmd('git', 'update-ref', f'refs/heads/{branch}', commit_out.strip())
+    finally:
+      if os.path.exists(tmp_index):
+        os.unlink(tmp_index)
+
+  def _finish_xtax_merge(self, merge_state: dict) -> None:
+    """Finish resolving _xtax merge conflicts after user has edited the conflict files."""
+    from git_xtax.stack_state import popen_cmd
+
+    branch = self._storage.BRANCH
+    remote_ref = f'origin/{branch}'
+    conflict_dir = os.path.join(self._git._root_dir, '.git', 'xtax-conflicts')
+
+    local_only = set(merge_state.get('local_only', []))
+    resolved = merge_state.get('resolved', {})
+    conflict_files = merge_state.get('conflict_files', [])
+    ancestor_hash = merge_state['ancestor']
+
+    # Read user-resolved conflict files
+    for filename in conflict_files:
+      conflict_path = os.path.join(conflict_dir, filename)
+      if not os.path.exists(conflict_path):
+        raise XtaxException(f"Missing resolved file: {conflict_path}")
+      with open(conflict_path) as f:
+        content = f.read()
+      if '<<<<<<<' in content or '>>>>>>>' in content:
+        raise XtaxException(f"Conflict markers still present in {conflict_path}")
+      path = f'stacks/{filename}'
+      resolved[path] = content
+
+    all_local = local_only | set(resolved.keys())
+    self._merge_xtax_trees(all_local, resolved, branch, remote_ref, ancestor_hash)
 
   @staticmethod
   def _resolve_ssh_alias(url: str) -> Optional[str]:
@@ -550,6 +712,7 @@ class XtaxClient:
     print(f"Created stack {bold(name)} (root: {bold(root)}, branch: {bold(first_branch)})")
 
   def cmd_stack(self, args: List[str], stack_name: Optional[str] = None) -> None:
+    self._fetch_stacks()
     if not args:
       raise XtaxException("Usage: git xtax stack <branch> [--onto=<parent>]")
 
@@ -622,6 +785,7 @@ class XtaxClient:
     print(f"Stacked {bold(branch)} onto {bold(parent)} in stack {bold(name)}")
 
   def cmd_tuck(self, args: List[str]) -> None:
+    self._fetch_stacks()
     if not args:
       raise XtaxException("Usage: git xtax tuck <branch>")
 
@@ -677,6 +841,7 @@ class XtaxClient:
     print(f"Tucked {bold(branch)} under {bold(current)} in stack {bold(name)}")
 
   def cmd_slideout(self, args: List[str], stack_name: Optional[str] = None) -> None:
+    self._fetch_stacks()
     if not args:
       raise XtaxException("Usage: git xtax slideout <branch>")
 
@@ -1591,11 +1756,23 @@ class XtaxClient:
 
   def cmd_push(self, args: List[str]) -> None:
     remote = 'origin'
+    is_continue = '--continue' in args
     for arg in args:
       if arg.startswith('--remote='):
         remote = arg[len('--remote='):]
 
-    # Check if resuming after conflict resolution
+    # Check if resuming after merge conflict resolution
+    merge_state = self._storage.load_merge_state()
+    if merge_state or is_continue:
+      if not merge_state:
+        raise XtaxException("No merge conflict in progress")
+      self._finish_xtax_merge(merge_state)
+      self._storage.push_stacks(remote)
+      self._storage.clear_merge_state()
+      print(f"Merged stack metadata and pushed to {remote}")
+      return
+
+    # Check if resuming after rebase conflict resolution
     push_state = self._storage.load_push_state()
     if push_state:
       self._storage.push_stacks(remote)
@@ -1912,6 +2089,7 @@ class XtaxClient:
       raise XtaxException(f"Stack {bold(name)} has no existing branches")
 
   def cmd_edit(self, args: List[str]) -> None:
+    self._fetch_stacks()
     name, state = self._resolve_current_stack()
     editor = os.environ.get('XTAX_EDITOR') or os.environ.get('VISUAL') or os.environ.get('EDITOR') or 'vi'
 
@@ -1934,6 +2112,7 @@ class XtaxClient:
       os.unlink(tmp_path)
 
   def cmd_rename(self, args: List[str]) -> None:
+    self._fetch_stacks()
     if len(args) < 2:
       raise XtaxException("Usage: git xtax rename <old-name> <new-name>")
 
@@ -1952,6 +2131,7 @@ class XtaxClient:
     print(f"Renamed stack {bold(old_name)} to {bold(new_name)}")
 
   def cmd_rename_branch(self, args: List[str]) -> None:
+    self._fetch_stacks()
     if len(args) < 2:
       raise XtaxException("Usage: git xtax rename-branch <old-branch> <new-branch>")
 

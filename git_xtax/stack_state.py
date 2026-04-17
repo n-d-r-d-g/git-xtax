@@ -197,27 +197,38 @@ class StackStorage:
     if os.path.exists(path):
       os.remove(path)
 
+  # --- Merge state (for _xtax conflict resolution) ---
+
+  def _merge_state_path(self) -> str:
+    return os.path.join(self._git_dir(), 'xtax-merge-state')
+
+  def save_merge_state(self, state: dict) -> None:
+    path = self._merge_state_path()
+    with open(path, 'w') as f:
+      json.dump(state, f)
+
+  def load_merge_state(self) -> Optional[dict]:
+    path = self._merge_state_path()
+    if not os.path.exists(path):
+      return None
+    with open(path, 'r') as f:
+      return json.load(f)
+
+  def clear_merge_state(self) -> None:
+    path = self._merge_state_path()
+    if os.path.exists(path):
+      os.remove(path)
+    conflict_dir = os.path.join(self._git_dir(), 'xtax-conflicts')
+    if os.path.isdir(conflict_dir):
+      import shutil
+      shutil.rmtree(conflict_dir)
+
   # --- Push/fetch ---
 
   def push_stacks(self, remote: str = 'origin') -> None:
     exit_code = run_cmd('git', 'push', remote, self.BRANCH)
     if exit_code != 0:
-      # Local _xtax may be behind remote — replay local tree on top of remote
-      remote_ref = f'{remote}/{self.BRANCH}'
-      popen_cmd('git', 'fetch', remote, self.BRANCH)
-      _, remote_hash, _ = popen_cmd('git', 'rev-parse', remote_ref)
-      remote_hash = remote_hash.strip()
-      # Get the tree of the local _xtax (our desired state)
-      _, local_tree, _ = popen_cmd('git', 'rev-parse', f'{self.BRANCH}^{{tree}}')
-      local_tree = local_tree.strip()
-      # Create a new commit with our tree on top of the remote
-      _, new_commit, _ = popen_cmd(
-        'git', 'commit-tree', local_tree, '-p', remote_hash, '-m', 'xtax: sync stack metadata')
-      new_commit = new_commit.strip()
-      popen_cmd('git', 'update-ref', f'refs/heads/{self.BRANCH}', new_commit)
-      exit_code = run_cmd('git', 'push', remote, self.BRANCH)
-      if exit_code != 0:
-        raise XtaxException(f"Failed to push stacks to {remote}")
+      raise XtaxException(f"Failed to push stacks to {remote}")
 
   def fetch_and_fast_forward(self, remote: str = 'origin') -> Optional[str]:
     """Fetch remote _xtax and fast-forward local ref if behind.
